@@ -1,0 +1,3 @@
+// launcher.rc - TeamBuddiesLauncher.exe resources
+1 ICON "..\\runtime\\app.ico"
+100 RCDATA "..\\CHANGELOG.md"

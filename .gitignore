@@ -1,0 +1,45 @@
+# Nothing from the game may be committed: no disc image, no files from the disc, no code translated from it.
+
+# build output: TeamBuddies.exe holds the translated game code (it ships only in release zips)
+/build/
+# recompiler output: the game's program translated to C++
+/generated/
+# files extracted from the disc
+/disc/
+# disc images
+*.cue
+*.bin
+*.iso
+*.img
+*.ccd
+*.sub
+*.mdf
+*.mds
+*.chd
+*.ecm
+*.pbp
+
+# release packages (tools/package_release.ps1)
+/dist/
+
+# tools built from their source
+/tools/*.exe
+
+# settings, logs and saves of a local run
+teambuddies.ini
+teambuddies.ini.tmp
+teambuddies.log
+savedata/
+memcards/
+*.mcd
+*.mcd.migrated
+
+# local tooling: the maintainer's test harness and agent settings stay on their PC
+/.claude/
+
+# editors and OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
