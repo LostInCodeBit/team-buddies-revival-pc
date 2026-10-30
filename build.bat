@@ -46,7 +46,8 @@ del /q "%ROOT%build\obj\recomp.obj" 2>nul
 rc /nologo /fo "%ROOT%build\game.res" "%ROOT%runtime\game.rc" || exit /b 1
 
 echo === linking
-link /nologo /DEBUG /OUT:"%ROOT%build\TeamBuddies.exe" /STACK:33554432 /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /MANIFEST:EMBED "%ROOT%build\obj\*.obj" "%ROOT%build\gen\*.obj" "%ROOT%build\game.res" "%ROOT%third_party\SDL3\lib\x64\SDL3.lib" || exit /b 1
+rem /PDBALTPATH: the exe names only its .pdb file, not the folder it was built in
+link /nologo /DEBUG /PDBALTPATH:%%_PDB%% /OUT:"%ROOT%build\TeamBuddies.exe" /STACK:33554432 /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /MANIFEST:EMBED "%ROOT%build\obj\*.obj" "%ROOT%build\gen\*.obj" "%ROOT%build\game.res" "%ROOT%third_party\SDL3\lib\x64\SDL3.lib" || exit /b 1
 rem only when newer: the launcher or the game may have the old one open, and copying over it fails
 xcopy /d /y /q "%ROOT%third_party\SDL3\lib\x64\SDL3.dll" "%ROOT%build\" >nul || exit /b 1
 echo === done: %ROOT%build\TeamBuddies.exe
@@ -56,6 +57,6 @@ echo === building launcher
 if not exist "%ROOT%build\launcher" mkdir "%ROOT%build\launcher"
 cl %CFLAGS% /I"%ROOT%third_party\SDL3\include" /MP /c "%ROOT%launcher\*.cpp" "%ROOT%runtime\settings.cpp" /Fo"%ROOT%build\launcher\\" || exit /b 1
 rc /nologo /fo "%ROOT%build\launcher\launcher.res" "%ROOT%launcher\launcher.rc" || exit /b 1
-link /nologo /DEBUG /OUT:"%ROOT%build\TeamBuddiesLauncher.exe" /SUBSYSTEM:WINDOWS /MANIFEST:EMBED "%ROOT%build\launcher\*.obj" "%ROOT%build\launcher\launcher.res" "%ROOT%third_party\SDL3\lib\x64\SDL3.lib" user32.lib gdi32.lib || exit /b 1
+link /nologo /DEBUG /PDBALTPATH:%%_PDB%% /OUT:"%ROOT%build\TeamBuddiesLauncher.exe" /SUBSYSTEM:WINDOWS /MANIFEST:EMBED "%ROOT%build\launcher\*.obj" "%ROOT%build\launcher\launcher.res" "%ROOT%third_party\SDL3\lib\x64\SDL3.lib" user32.lib gdi32.lib || exit /b 1
 xcopy /d /y /q "%ROOT%third_party\SDL3\lib\x64\SDL3.dll" "%ROOT%build\" >nul || exit /b 1
 echo === done: %ROOT%build\TeamBuddiesLauncher.exe

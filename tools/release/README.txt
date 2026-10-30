@@ -9,6 +9,8 @@ START
   2. Run TeamBuddiesLauncher.exe.
   3. Choose the .cue of your USA disc image (SLUS-00869) and press Play.
   Needs Windows 10/11 64-bit and a Direct3D 11 graphics card.
+  The programs aren't code-signed, so Windows may show "Windows protected your PC":
+  choose More info, then Run anyway.
 
 FILES
   TeamBuddiesLauncher.exe   settings, disc choice, patch notes and Play

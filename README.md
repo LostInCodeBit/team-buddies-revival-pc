@@ -24,7 +24,8 @@ native code. No emulator and no BIOS file. Bring your own disc.
    you can write to (not Program Files).
 2. Run `TeamBuddiesLauncher.exe`, choose the `.cue` of your **USA disc (SLUS-00869)** and press **Play**.
 
-Needs Windows 10/11 64-bit and a Direct3D 11 graphics card.
+Needs Windows 10/11 64-bit and a Direct3D 11 graphics card. The programs aren't code-signed, so Windows may
+show "Windows protected your PC": choose **More info → Run anyway**.
 
 ## Legal notice
 

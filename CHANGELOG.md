@@ -21,7 +21,8 @@ in it; *Changed* and *Fixed* record the development before it.
   `.gitattributes`. `tools\package_release.ps1 -Version x.y.z -SourceUrl <repo>` builds the portable
   `dist\TeamBuddies-x.y.z-win.zip` from an explicit file list (launcher, game, `SDL3.dll`, `README.txt` with a
   quick start and the legal notice, `PLAYING.md`, `CHANGELOG.md`, licences) plus `SHA256SUMS.txt`; it refuses
-  a build older than its sources. Tested by unzipping it alone and running the game from there.
+  a build older than its sources. Tested by unzipping it alone and running the game from there. The
+  executables name only their `.pdb` file (`/PDBALTPATH`), not the folder they were built in.
   `extra_seeds.txt` holds the two functions found at run time (`build\misses.txt`), so a fresh checkout
   recompiles the same code.
 - `frame_rate = 60` (F10, launcher Graphics tab): gameplay, which the game itself runs at 30 fps with one fixed
