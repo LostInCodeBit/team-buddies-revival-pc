@@ -1,0 +1,36 @@
+// present.hlsl - the last draw of a frame: a region of the picture into the window's viewport (aspect, filtering).
+// One source for Direct3D 11 (platform.cpp, from present_hlsl.inc) and SDL GPU (sdl/sdl_present.cpp, SPIR-V
+// from sdl/shaders_spirv.inc); run tools/build_shaders.py after editing.
+#ifdef __spirv__
+#define SLOT(n) [[vk::combinedImageSampler]] [[vk::binding(n, 2)]]
+#define CBUFFER [[vk::binding(0, 1)]] cbuffer
+#else
+#define SLOT(n)
+#define CBUFFER cbuffer
+#endif
+CBUFFER C : register(b0) { float4 uvrect; };
+struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VO vs_main(uint id : SV_VertexID) {
+    VO o;
+    float2 p = float2(id & 1, id >> 1);
+    o.pos = float4(p.x * 2 - 1, 1 - p.y * 2, 0, 1);
+    o.uv = lerp(uvrect.xy, uvrect.zw, p);
+    return o;
+}
+SLOT(0) Texture2D tex : register(t0);
+SLOT(0) SamplerState smp : register(s0);
+float4 ps_main(VO i) : SV_Target {
+    float w, h;
+    tex.GetDimensions(w, h);
+    float2 size = float2(w, h);
+    float2 fp = float2(abs(ddx(i.uv.x)), abs(ddy(i.uv.y))) * size; // source texels per screen pixel
+    if (max(fp.x, fp.y) <= 1.0) return float4(tex.SampleLevel(smp, i.uv, 0).rgb, 1); // one mip level only
+    // drawn smaller than the source (an internal resolution above the window's): average the texels each pixel
+    // covers instead of picking one, so the extra resolution (and MSAA's blended edges) smooth the picture
+    int2 n = (int2)min(ceil(fp), 4.0);
+    float3 acc = 0;
+    for (int y = 0; y < n.y; y++)
+        for (int x = 0; x < n.x; x++)
+            acc += tex.SampleLevel(smp, i.uv + (float2(x, y) + 0.5 - n * 0.5) * fp / n / size, 0).rgb; // no gradients in a loop
+    return float4(acc / (n.x * n.y), 1);
+}

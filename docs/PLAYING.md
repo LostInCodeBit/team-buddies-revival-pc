@@ -6,6 +6,9 @@ Run `TeamBuddiesLauncher.exe` to change settings, choose the disc image and play
 runs. `TeamBuddies.exe` also runs on its own: it finds the `.cue` next to it (or in parent folders) or asks for
 it, then remembers the path in `teambuddies.ini`. Only the USA disc (SLUS-00869) is supported.
 
+On Linux there is no launcher: run `./TeamBuddies` (optionally with the `.cue` as argument); settings are in
+`teambuddies.ini` and on the hotkeys. Without Vulkan drivers the game falls back to the software renderer.
+
 Everything the game writes stays in its folder: `teambuddies.ini`, `teambuddies.log`, `savedata\`,
 `screenshots\`. To update, unzip the new version over the old one; settings and saves are kept.
 
@@ -18,11 +21,11 @@ images are split into files on the first start and kept as `cardN.mcd.migrated`.
 
 ## Settings (`teambuddies.ini`)
 
-The launcher's Settings page writes these; the file can also be edited by hand.
+The launcher's Settings page (Windows) writes these; the file can also be edited by hand.
 
 | Key | Values |
 |---|---|
-| `renderer` | `hardware` (Direct3D 11, upscaled) or `software` (original 1x) |
+| `renderer` | `hardware` (upscaled: Direct3D 11 on Windows, Vulkan on Linux) or `software` (original 1x) |
 | `resolution_scale` | 1–8 (internal resolution multiplier; above the window's size it is averaged down, like supersampling) |
 | `anti_aliasing` | `off`, `fxaa`, `msaa2x`/`4x`/`8x` (polygon edges), `ssaa2x`/`4x`/`8x` (edges and textures) (hardware renderer, F1) |
 | `display` | `window`, `borderless`, `fullscreen` (exclusive) |
@@ -62,9 +65,10 @@ with both players' `teambuddies.log`.
 
 Press F9, choose *Host* or *Join* (enter the host's address), and the game restarts connected; or start it
 with `TeamBuddies.exe --host [port]` / `--join <address>[:port]` (`--delay N` overrides the input delay).
-Both players need the same disc image and the same version. The host is player 1, the client player 2 (pick
-*MULTI*, player 2 joins with ○). Default port: UDP 7845; the host's router is asked to forward it via UPnP,
-otherwise forward it manually and allow the game through the Windows firewall.
+On Linux the address is asked with `zenity` or `kdialog` (without either, use `--join` or `online_address`),
+the window title shows the connection's progress and Esc gives up. Both players need the same disc image and
+the same version. The host is player 1, the client player 2 (pick *MULTI*, player 2 joins with ○). Default port: UDP 7845; the host's router is asked to forward
+it via UPnP, otherwise forward it manually and allow the game through the firewall.
 Both PCs run the whole game in lockstep and exchange only pad input, so play feels like local split-screen
 with a small input delay chosen from the ping; a RAM fingerprint every 2 s detects desyncs.
 

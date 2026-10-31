@@ -1,22 +1,17 @@
 // icon_atlas.cpp - high-resolution glyphs that replace the game's PlayStation button prompts when the
-// player uses a keyboard or an Xbox-style controller. Drawn once at startup with GDI+ into one atlas:
-// row 0 = Xbox, row 1 = keyboard, one 256x256 cell per IconId, premultiplied BGRA.
+// player uses a keyboard or an Xbox-style controller. Drawn once at startup with GDI+ into one atlas
+// (icon_atlas.h): row 0 = Xbox, row 1 = keyboard, one 256x256 cell per IconId, premultiplied BGRA.
 #define NOMINMAX
 #include <windows.h>
 #include <algorithm>
 namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
-#include "psx.h"
+#include "icon_atlas.h"
 #pragma comment(lib, "gdiplus.lib")
 
 using namespace Gdiplus;
 
-static const int CELL = 256, ROWS = 2;
-static std::vector<u32> s_atlas; // premultiplied BGRA, (ICON_COUNT * CELL) x (ROWS * CELL)
-static bool s_has[ROWS][ICON_COUNT];
-
-// on-screen width/height of the game's sprite for each icon (32x16 texels in 640-wide modes = square)
-static float icon_aspect(int id) { return id == ICON_START || id == ICON_SELECT ? 1.5f : 1.0f; }
+static const int CELL = ICON_CELL, ROWS = ICON_ROWS;
 
 static void rounded_rect(GraphicsPath& p, float x, float y, float w, float h, float r) {
     float d = r * 2;
@@ -108,6 +103,7 @@ void icon_atlas_build() {
     ULONG_PTR token;
     GdiplusStartupInput in;
     if (GdiplusStartup(&token, &in, nullptr) != Ok) { plog("icons: GDI+ unavailable, keeping PlayStation prompts\n"); return; }
+    bool has[ROWS][ICON_COUNT] = {};
     {
         int W = ICON_COUNT * CELL, H = ROWS * CELL;
         Bitmap bmp(W, H, PixelFormat32bppPARGB);
@@ -125,46 +121,17 @@ void icon_atlas_build() {
                 g.ScaleTransform(1.0f / a, 1.0f);
                 bool known = id <= ICON_START;
                 if (known) (row == 0 ? draw_xbox : draw_key)(g, id, w, h);
-                s_has[row][id] = known;
+                has[row][id] = known;
                 g.Restore(saved);
             }
         BitmapData bd;
         Rect r(0, 0, W, H);
         if (bmp.LockBits(&r, ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Ok) {
-            s_atlas.resize((size_t)W * H);
-            for (int y = 0; y < H; y++) memcpy(&s_atlas[(size_t)y * W], (const u8*)bd.Scan0 + (size_t)y * bd.Stride, (size_t)W * 4);
+            std::vector<u32> px((size_t)W * H);
+            for (int y = 0; y < H; y++) memcpy(&px[(size_t)y * W], (const u8*)bd.Scan0 + (size_t)y * bd.Stride, (size_t)W * 4);
             bmp.UnlockBits(&bd);
+            icon_atlas_set(std::move(px), has);
         }
     }
     GdiplusShutdown(token);
-}
-
-const u32* icon_atlas_pixels(int& w, int& h) {
-    w = ICON_COUNT * CELL;
-    h = ROWS * CELL;
-    return s_atlas.empty() ? nullptr : s_atlas.data();
-}
-
-int icon_slot(InputDevice dev, IconId id) {
-    if (id == ICON_NONE || s_atlas.empty()) return -1;
-    int row = dev == DEV_XBOX ? 0 : dev == DEV_KEYBOARD ? 1 : -1;
-    if (row < 0 || !s_has[row][id]) return -1;
-    return row * ICON_COUNT + id;
-}
-
-// software renderer: box-filtered texel (u, v) of a w x h sprite mapped onto the slot's cell, as 15-bit color
-u16 icon_sample_555(int slot, int u, int v, int w, int h) {
-    int W = ICON_COUNT * CELL;
-    int cx = (slot % ICON_COUNT) * CELL, cy = (slot / ICON_COUNT) * CELL;
-    int x0 = cx + u * CELL / w, x1 = cx + (u + 1) * CELL / w, y0 = cy + v * CELL / h, y1 = cy + (v + 1) * CELL / h;
-    u32 sa = 0, sr = 0, sg = 0, sb = 0, n = 0;
-    for (int y = y0; y < y1; y += 2)
-        for (int x = x0; x < x1; x += 2) {
-            u32 p = s_atlas[(size_t)y * W + x];
-            sb += p & 0xFF; sg += (p >> 8) & 0xFF; sr += (p >> 16) & 0xFF; sa += p >> 24; n++;
-        }
-    if (!n || sa < n * 128) return 0; // transparent
-    u32 r = sr * 255 / sa, g = sg * 255 / sa, b = sb * 255 / sa;
-    u16 c = (u16)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
-    return c ? c : 0x0421; // black would read as "transparent" on the PS1
 }

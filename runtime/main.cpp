@@ -1,28 +1,27 @@
 // main.cpp - Team Buddies native port entry point.
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "files.h"
+#ifdef _WIN32
 #include <commdlg.h>
+#else
+#include <sys/resource.h>
+#endif
 #include "psx.h"
 #include <fstream>
 #include <sstream>
 #include <map>
 #include <cstdlib>
+#include <cstring>
 
+#ifdef _WIN32
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "ole32.lib")
+#endif
 
 // ---------------------------------------------------------------- disc discovery
-static bool file_exists(const std::string& p) { DWORD a = GetFileAttributesA(p.c_str()); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
-
 static std::string find_cue(std::string dir) {
     for (int up = 0; up < 3; up++) {
-        WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA((dir + "*.cue").c_str(), &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            FindClose(h);
-            return dir + fd.cFileName;
-        }
+        std::vector<std::string> cues = list_files(dir.size() > 1 ? dir.substr(0, dir.size() - 1) : dir, ".cue");
+        if (!cues.empty()) return dir + cues.front();
         if (dir.size() < 4) break;
         size_t s = dir.find_last_of("\\/", dir.size() - 2);
         if (s == std::string::npos) break;
@@ -31,6 +30,7 @@ static std::string find_cue(std::string dir) {
     return "";
 }
 
+#ifdef _WIN32
 static std::string ask_cue() {
     char buf[MAX_PATH] = "";
     OPENFILENAMEA ofn = {sizeof ofn};
@@ -43,9 +43,11 @@ static std::string ask_cue() {
     return "";
 }
 
-static void ev_spu(int id) {
-    sched_repeat(id, 768 * 32, ev_spu);
-    spu_tick(32);
+static std::string exe_dir() {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    std::string d = exe_path;
+    return d.substr(0, d.find_last_of("\\/") + 1);
 }
 
 // hybrid-graphics drivers (NVIDIA Optimus, AMD PowerXpress) run exes exporting these on the discrete GPU
@@ -53,17 +55,46 @@ extern "C" {
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
+#else
+std::string platform_ask_disc(); // the desktop's file chooser (platform_sdl.cpp)
+static std::string ask_cue() { return getenv("TB_HIDDEN") ? "" : platform_ask_disc(); }
+
+static std::string exe_dir() {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n <= 0) return "./";
+    std::string d(buf, (size_t)n);
+    return d.substr(0, d.find_last_of('/') + 1);
+}
+
+// the recompiled code nests calls deeply (the Windows exe reserves a 32 MB stack); the main thread's stack
+// grows up to this limit, which is 8 MB by default
+static void raise_stack_limit() {
+    const rlim_t want = (rlim_t)64 << 20;
+    rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= want) return;
+    rl.rlim_cur = rl.rlim_max != RLIM_INFINITY && rl.rlim_max < want ? rl.rlim_max : want;
+    setrlimit(RLIMIT_STACK, &rl);
+}
+#endif
+
+static void ev_spu(int id) {
+    sched_repeat(id, 768 * 32, ev_spu);
+    spu_tick(32);
+}
 
 int main(int argc, char** argv) {
-    char exe_path[MAX_PATH];
-    GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
-    g_base_dir = exe_path;
-    g_base_dir = g_base_dir.substr(0, g_base_dir.find_last_of("\\/") + 1);
+#ifndef _WIN32
+    raise_stack_limit();
+#endif
+    g_base_dir = exe_dir();
     g_ini_path = getenv("TB_INI") ? std::string(getenv("TB_INI")) : g_base_dir + "teambuddies.ini";
     const std::string& ini = g_ini_path;
     settings_load(ini);
+#ifdef _WIN32
     // release builds have no console; log_level >= 2 opens one for the live log
     if (g_settings.log_level >= 2 && !getenv("TB_HIDDEN") && AllocConsole()) { FILE* f; freopen_s(&f, "CONOUT$", "w", stdout); }
+#endif
     if (argc > 1 && strncmp(argv[1], "--", 2) != 0) g_settings.disc = argv[1];
     if (g_settings.disc.empty() || !file_exists(g_settings.disc)) g_settings.disc = find_cue(g_base_dir);
     if (g_settings.disc.empty() || !file_exists(g_settings.disc)) g_settings.disc = ask_cue();
@@ -111,7 +142,7 @@ int main(int argc, char** argv) {
     if (!platform_init()) fatal("Cannot create the game window");
     g_renderer = nullptr;
     icon_atlas_build(); // keyboard / Xbox button glyphs
-    if (g_settings.renderer == 1) g_renderer = renderer_create_d3d11(gpu_vram());
+    g_renderer = renderer_create_hardware(gpu_vram());
     if (!g_renderer) g_renderer = renderer_create_software(gpu_vram());
     if (!netplay_start(argc, argv, exe)) { platform_shutdown(); return 0; } // --host / --join
 

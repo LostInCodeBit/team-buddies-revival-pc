@@ -1,7 +1,5 @@
 // settings.cpp - teambuddies.ini reader/writer, shared by the game and the launcher.
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "files.h"
 #include "settings.h"
 #include <algorithm>
 #include <cstdlib>
@@ -93,7 +91,7 @@ bool settings_save(const std::string& path) {
         auto b = [](bool v) { return v ? "true" : "false"; };
         f << "; Team Buddies native port settings (also edited by TeamBuddiesLauncher.exe)\n";
         f << "disc = " << s.disc << "\n\n";
-        f << "; renderer: hardware (Direct3D 11, upscaled) or software (original 1x)\n";
+        f << "; renderer: hardware (upscaled: Direct3D 11 on Windows, Vulkan on Linux) or software (original 1x)\n";
         f << "renderer = " << (s.renderer ? "hardware" : "software") << "\n";
         f << "; internal resolution multiplier for the hardware renderer (1-8), F2/F3 in game\n";
         f << "resolution_scale = " << s.scale << "\n";
@@ -135,7 +133,7 @@ bool settings_save(const std::string& path) {
         f << "online_port = " << s.online_port << "\n";
         f << "log_level = " << s.log_level << "\n";
         f.flush();
-        if (!f) { f.close(); DeleteFileA(tmp.c_str()); return false; }
+        if (!f) { f.close(); file_delete(tmp); return false; }
     }
-    return MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    return file_move(tmp, path, MOVE_DURABLE);
 }

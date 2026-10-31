@@ -117,9 +117,18 @@ static void ev_vblank(int id) {
     static const long long ram_dump_at = getenv("TB_RAM_DUMP") ? atoll(getenv("TB_RAM_DUMP")) : -1;
     if ((long long)g_dbg_frames == ram_dump_at) {
         std::string dir = getenv("TB_SHOT_DIR") ? getenv("TB_SHOT_DIR") : g_base_dir;
-        if (FILE* f = fopen((dir + "\\ram.bin").c_str(), "wb")) { fwrite(g_ram, 1, 0x200000, f); fclose(f); }
-        if (FILE* f = fopen((dir + "\\vram.bin").c_str(), "wb")) { fwrite(gpu_vram(), 2, 1024 * 512, f); fclose(f); }
+        if (FILE* f = fopen((dir + PATH_SEP "ram.bin").c_str(), "wb")) { fwrite(g_ram, 1, 0x200000, f); fclose(f); }
+        if (FILE* f = fopen((dir + PATH_SEP "vram.bin").c_str(), "wb")) { fwrite(gpu_vram(), 2, 1024 * 512, f); fclose(f); }
         plog("ram and vram dumped to %s\n", dir.c_str());
+    }
+    // test harness: TB_RAM_TRACE=from:to logs the cycle count and a RAM fingerprint at every vblank in that range
+    // (where two builds that should run the same first part ways)
+    static long long trace_from = -1, trace_to = -1;
+    if (trace_from < 0) { trace_from = 0; if (const char* e = getenv("TB_RAM_TRACE")) sscanf(e, "%lld:%lld", &trace_from, &trace_to); }
+    if ((long long)g_dbg_frames >= trace_from && (long long)g_dbg_frames <= trace_to) {
+        u64 h = 1469598103934665603ull;
+        for (u32 i = 0; i < 0x200000; i += 8) { u64 w; memcpy(&w, g_ram + i, 8); h = (h ^ w) * 1099511628211ull; }
+        plog("vb %llu cycles=%llu ram=%016llX\n", (unsigned long long)g_dbg_frames, (unsigned long long)g_cycles, (unsigned long long)h);
     }
     static const char* poke = getenv("TB_POKE8"); // test harness: "hexaddr=value", a RAM byte forced every vblank
     if (poke) {

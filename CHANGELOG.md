@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Linux version (x86-64, glibc 2.35+): an SDL3 platform layer (window, fullscreen, sound, keyboard,
+  controllers, disc file dialog, crash and hang stacks in the log) in `runtime/sdl/`, built with `build.sh`
+  (GCC or Clang). The C++ runtime is linked in and `libSDL3.so.0` is found next to the game.
+- Vulkan hardware renderer through SDL GPU: the Direct3D 11 renderer's features (1x–8x, FXAA/MSAA/SSAA,
+  xBR, HD text, in-between frames, resolution changes while playing) with the same shaders as SPIR-V. A
+  presenter does the aspect, smooth output and vsync (mailbox when vsync is off); without Vulkan the
+  software renderer is used and its frames still go through the GPU when one is there. Tested with Mesa's
+  llvmpipe on Linux and on an NVIDIA GPU (`build.bat sdl`): the same RAM fingerprints as Direct3D 11, and
+  screenshots that differ only in sub-pixel rounding, MSAA edge blending and the HD letters' mip filtering.
+- Online play on Linux: `netplay.cpp` runs on POSIX sockets; the router port forward is a small UPnP IGD
+  client (SSDP discovery, SOAP `AddPortMapping`, lease fallback for IGD 2, removal at the end, timeouts and
+  size limits on every step); F9 asks Host / Join with message boxes and the address with `zenity` or
+  `kdialog`, then restarts the game into the session; Esc gives up while connecting.
+- Keyboard and Xbox button prompts on Linux, drawn without GDI+: the same shapes and a small bold stroke
+  alphabet sized to Arial Black's letters.
+- `tools/package_linux.sh <version> <source url>`: `dist/TeamBuddies-<version>-linux-x86_64.tar.gz` from an
+  explicit file list, its line added to `dist/SHA256SUMS.txt` (which `package_release.ps1` now also keeps
+  instead of overwriting).
+- `runtime/shaders/gpu.hlsl` and `present.hlsl` are the one source of both renderers'
+  shaders; `tools/build_shaders.py` writes the HLSL includes for Direct3D 11 and the SPIR-V (DXC, HLSL 2018
+  rules as FXC uses), with each shader's texture and constant slots read from the SPIR-V and checked.
+- `build.bat sdl`: `build\TeamBuddiesSDL.exe`, a Windows test build of the Linux code paths (not shipped).
+- Test hooks: `TB_RAM_TRACE=from:to` logs the cycle count and a RAM fingerprint at every vblank in that
+  range; `TB_UPNP_LOCATION=<url>` skips the UPnP discovery (a stand-in gateway); `TB_ICON_DUMP=<file.png>`
+  saves the button prompt atlas.
+
+### Changed
+- The hardware renderer's batching, CPU copy of VRAM, dirty tiles and HD letter atlas moved to `gpu_hw.h`,
+  shared by the Direct3D 11 and Vulkan backends; the Win32 parts of the platform code are in `platform.cpp`,
+  the rest in `platform_common.cpp`; file operations in `files.h`. The Windows build gives the same RAM
+  fingerprints and screenshots as 0.1.0 (default, MSAA, SSAA and FXAA settings checked; FXC compiles the
+  moved shaders to identical bytecode).
+
+### Fixed
+- Direct3D 11: a batch of more than 131,072 vertices was cut mid-triangle; draws now take whole triangles.
+
 ## 0.1.0 - 2026-10-30
 
 First public release. It contains no game data: you need your own USA disc (SLUS-00869). Everything below is

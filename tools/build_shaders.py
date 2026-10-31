@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Builds the shader include files from runtime/shaders/*.hlsl (run it after editing a shader):
+
+  runtime/shaders/gpu_hlsl.inc, present_hlsl.inc   the HLSL text, which the Direct3D 11 renderer compiles at start
+  runtime/sdl/shaders_spirv.inc                     SPIR-V for the SDL GPU renderer (Vulkan), compiled here with DXC
+
+The outputs are committed, so building the game needs no shader compiler. DXC (with SPIR-V support, as in
+Microsoft's release builds or the Vulkan SDK): the DXC environment variable, else ../tools/dxc next to the
+repository (bin/x64/dxc.exe on Windows, bin/dxc elsewhere), else dxc on the PATH.
+
+  python tools/build_shaders.py
+"""
+import os, shutil, struct, subprocess, sys, tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHADERS = os.path.join(ROOT, "runtime", "shaders")
+
+# name in shaders_spirv.inc, source, entry point, stage, defines
+SPIRV = [
+    ("vs_main", "gpu.hlsl", "vs_main", "vs", ["VERTEX"]),
+    ("vs_rect", "gpu.hlsl", "vs_rect", "vs", ["VERTEX"]),
+    ("vs_full", "gpu.hlsl", "vs_full", "vs", ["VERTEX"]),
+    ("ps_main", "gpu.hlsl", "ps_main", "ps", []),
+    ("ps_sample", "gpu.hlsl", "ps_main", "ps", ["PER_SAMPLE"]),  # SSAA: shaded per sample
+    ("ps_upload", "gpu.hlsl", "ps_upload", "ps", []),
+    ("ps_fill", "gpu.hlsl", "ps_fill", "ps", []),
+    ("ps_down", "gpu.hlsl", "ps_down", "ps", []),
+    ("ps_copy", "gpu.hlsl", "ps_copy", "ps", []),
+    ("ps_fxaa", "gpu.hlsl", "ps_fxaa", "ps", []),
+    ("ps_glyph", "gpu.hlsl", "ps_glyph", "ps", []),
+    ("vs_present", "present.hlsl", "vs_main", "vs", ["VERTEX"]),
+    ("ps_present", "present.hlsl", "ps_main", "ps", []),
+]
+PIECE = 15000  # MSVC takes at most ~16 KB per string literal; the pieces are joined by the compiler
+
+
+def find_dxc():
+    if os.environ.get("DXC"):
+        return os.environ["DXC"]
+    local = os.path.join(os.path.dirname(ROOT), "tools", "dxc", "bin", "x64" if os.name == "nt" else "", "dxc.exe" if os.name == "nt" else "dxc")
+    if os.path.isfile(local):
+        return local
+    found = shutil.which("dxc")
+    if not found:
+        sys.exit("DXC not found: set DXC to dxc's path (it needs SPIR-V support)")
+    return found
+
+
+def reflect(name, stage, words):
+    """The resources an SDL GPU shader declares, from its SPIR-V: (samplers, uniform buffers). SDL's layout:
+    vertex textures in set 0 and uniforms in set 1, fragment textures in set 2 and uniforms in set 3, each
+    numbered from 0 (the slot). Textures must be combined image-samplers; anything else stops the build."""
+    deco, types, var_type = {}, {}, {}
+    i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xFFFF
+        if n == 0:
+            sys.exit(name + ": bad SPIR-V")
+        args = words[i + 1:i + n]
+        if op == 71 and len(args) >= 3 and args[1] in (33, 34):  # OpDecorate <id> Binding|DescriptorSet <n>
+            deco.setdefault(args[0], {})[args[1]] = args[2]
+        elif op in (25, 27, 30):  # OpTypeImage, OpTypeSampledImage, OpTypeStruct <result>
+            types[args[0]] = op
+        elif op == 32:  # OpTypePointer <result> <storage class> <type>
+            types[args[0]] = ("ptr", args[2])
+        elif op == 59:  # OpVariable <type> <result> <storage class>
+            var_type[args[1]] = args[0]
+        i += n
+    tex_set, ubo_set = (0, 1) if stage == "vs" else (2, 3)
+    slots = {tex_set: set(), ubo_set: set()}
+    for vid, d in deco.items():
+        dset, binding = d.get(34), d.get(33)
+        if dset is None or binding is None:
+            continue
+        ptr = types.get(var_type.get(vid))
+        kind = types.get(ptr[1]) if isinstance(ptr, tuple) else None
+        want = 27 if dset == tex_set else 30 if dset == ubo_set else None
+        if want is None:
+            sys.exit("%s: a resource in descriptor set %d (a %s shader uses sets %d and %d)" % (name, dset, stage, tex_set, ubo_set))
+        if kind != want:
+            sys.exit("%s: set %d binding %d is not a %s" % (name, dset, binding, "combined image-sampler" if want == 27 else "uniform buffer"))
+        slots[dset].add(binding)
+    return tuple(max(slots[k]) + 1 if slots[k] else 0 for k in (tex_set, ubo_set))
+
+
+def write_if_changed(path, text):
+    old = open(path, encoding="utf-8").read() if os.path.isfile(path) else None
+    if old == text:
+        return False
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def hlsl_inc(name):
+    src = open(os.path.join(SHADERS, name), encoding="utf-8").read()
+    if ')HLSL"' in src:
+        sys.exit(name + ' contains the raw string delimiter )HLSL"')
+    pieces, cur = [], ""
+    for line in src.splitlines(keepends=True):
+        if cur and len(cur) + len(line) > PIECE:
+            pieces.append(cur)
+            cur = ""
+        cur += line
+    pieces.append(cur)
+    out = "// generated by tools/build_shaders.py from runtime/shaders/%s - do not edit\n" % name
+    out += "".join('R"HLSL(%s)HLSL"\n' % p for p in pieces)
+    return out
+
+
+def main():
+    dxc = find_dxc()
+    version = subprocess.run([dxc, "--version"], capture_output=True, text=True).stdout.strip().splitlines()
+    out = ["// generated by tools/build_shaders.py from runtime/shaders/*.hlsl - do not edit",
+           "// (%s)" % (version[0] if version else "dxc"), ""]
+    table = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, src, entry, stage, defines in SPIRV:
+            spv = os.path.join(tmp, name + ".spv")
+            # -HV 2018: vector && / || work per component, as with FXC, which compiles the same text for Direct3D 11
+            cmd = [dxc, "-spirv", "-fspv-target-env=vulkan1.0", "-fvk-use-dx-layout", "-HV", "2018", "-O3", "-T", stage + "_6_0",
+                   "-E", entry, "-Fo", spv, os.path.join(SHADERS, src)]
+            for d in defines:
+                cmd[1:1] = ["-D", d]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                sys.exit("%s (%s %s): %s" % (name, src, entry, (r.stderr or r.stdout).strip()))
+            code = open(spv, "rb").read()
+            words = struct.unpack("<%dI" % (len(code) // 4), code)
+            body = ",\n".join("    " + ", ".join("0x%08X" % w for w in words[i:i + 8]) for i in range(0, len(words), 8))
+            samplers, uniforms = reflect(name, stage, words)
+            out.append("static const u32 k_spv_%s[] = {\n%s\n};" % (name, body))
+            table.append('    {"%s", "%s", %s, k_spv_%s, sizeof k_spv_%s, %d, %d},' %
+                         (name, entry, "true" if stage == "vs" else "false", name, name, samplers, uniforms))
+    out.append("")
+    out.append("// samplers: texture slots 0..n-1 (unused ones in between included); uniforms: uniform buffer slots")
+    out.append("struct SpirvShader { const char* name; const char* entry; bool vertex; const u32* code; size_t size; int samplers, uniforms; };")
+    out.append("static const SpirvShader k_spirv[] = {\n%s\n};" % "\n".join(table))
+    changed = []
+    for path, text in [(os.path.join(SHADERS, "gpu_hlsl.inc"), hlsl_inc("gpu.hlsl")),
+                       (os.path.join(SHADERS, "present_hlsl.inc"), hlsl_inc("present.hlsl")),
+                       (os.path.join(ROOT, "runtime", "sdl", "shaders_spirv.inc"), "\n".join(out) + "\n")]:
+        if write_if_changed(path, text):
+            changed.append(os.path.relpath(path, ROOT))
+    print("%d SPIR-V shaders; %s" % (len(SPIRV), ("updated " + ", ".join(changed)) if changed else "nothing changed"))
+
+
+if __name__ == "__main__":
+    main()

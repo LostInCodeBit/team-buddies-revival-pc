@@ -1,6 +1,6 @@
 # Team Buddies — native PC port
 
-A native 64-bit Windows port of *Team Buddies* (PlayStation, 2000), USA release (SLUS-00869). The game's
+A native 64-bit Windows and Linux port of *Team Buddies* (PlayStation, 2000), USA release (SLUS-00869). The game's
 program is statically recompiled to C++; the PlayStation hardware (GPU, sound, CD-ROM, BIOS) is replaced by
 native code. No emulator and no BIOS file. Bring your own disc.
 
@@ -9,8 +9,9 @@ native code. No emulator and no BIOS file. Bring your own disc.
 
 ## Features
 
-- A launcher with the settings, the disc check, saves and the patch notes.
-- Direct3D 11 renderer: 1x–8x resolution, widescreen, FXAA/MSAA/SSAA, xBR texture filtering, HD text
+- A launcher (Windows) with the settings, the disc check, saves and the patch notes.
+- Hardware renderer, Direct3D 11 on Windows and Vulkan on Linux: 1x–8x resolution, widescreen,
+  FXAA/MSAA/SSAA, xBR texture filtering, HD text
   and HUD numbers, 60 fps or more (up to 500, or the monitor's rate) with in-between frames while the game
   keeps its speed.
 - Online play for 2 players (lockstep, UPnP): experimental, still a work in progress.
@@ -27,6 +28,12 @@ native code. No emulator and no BIOS file. Bring your own disc.
 Needs Windows 10/11 64-bit and a Direct3D 11 graphics card. The programs aren't code-signed, so Windows may
 show "Windows protected your PC": choose **More info → Run anyway**.
 
+**Linux:** unpack `TeamBuddies-<version>-linux-x86_64.tar.gz` into a folder you can write to and run
+`./TeamBuddies`; it asks for the `.cue` (or takes it as an argument). Needs x86-64 with glibc 2.35 or newer
+(Ubuntu 22.04, Debian 12, Fedora 36 or later), X11 or Wayland, and Vulkan drivers for the hardware renderer
+(without them the game uses its software renderer). There is no launcher: settings are in `teambuddies.ini`
+and on the hotkeys.
+
 ## Legal notice
 
 - This is a fan project. It is not made, endorsed or supported by the game's developer or publishers, or
@@ -39,8 +46,9 @@ show "Windows protected your PC": choose **More info → Run anyway**.
 
 ## Building
 
-C++17 with Visual Studio 2022 Build Tools; `build.bat` recompiles the game from your own disc image, so
-nothing builds without it. Details, layout and tests: [docs/BUILDING.md](docs/BUILDING.md).
+C++17: Visual Studio 2022 Build Tools with `build.bat` on Windows, GCC or Clang and SDL 3.4 with `build.sh` on
+Linux. Both recompile the game from your own disc image, so nothing builds without it. Details, layout and
+tests: [docs/BUILDING.md](docs/BUILDING.md).
 
 ## Credits and licence
 

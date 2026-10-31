@@ -12,6 +12,9 @@
 //   3. client -> READY with the input delay; host -> START; both boot the game at frame 0.
 //   Every 120 frames each side sends a RAM fingerprint; a mismatch ends the session ("desync").
 //   The host asks the router for a UDP port forward (UPnP) in the background.
+// Windows: Winsock and its UPnP NAT API; elsewhere POSIX sockets and upnp_igd.cpp. The dialogs: netplay_ui.cpp
+// (Windows), sdl/netplay_ui_sdl.cpp (the SDL build).
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #ifndef SIO_UDP_CONNRESET
@@ -19,15 +22,29 @@
 #endif
 #include <windows.h>
 #include <natupnp.h>
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+typedef int SOCKET;
+const SOCKET INVALID_SOCKET = -1;
+#define closesocket close
+#endif
 #include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cstring>
 #include <string>
 #include <thread>
 #include "psx.h"
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "oleaut32.lib")
 
 extern bool g_gpu_widescreen_hack; // gte.cpp
 extern u64 g_dbg_frames;           // sched.cpp
@@ -35,6 +52,10 @@ void np_status_open();
 void np_status_text(const char* t);
 bool np_status_cancelled();
 void np_status_close();
+void np_message(const char* text, bool warning); // a message box (any thread)
+#ifndef _WIN32
+std::string upnp_igd_forward(int port, bool add, const std::string& local_ip); // sdl/upnp_igd.cpp
+#endif
 
 namespace {
 
@@ -44,7 +65,7 @@ const int DEFAULT_PORT = 7845;
 const int CARD_BYTES = 128 * 1024, CHUNK = 1024, CHUNKS = 2 * CARD_BYTES / CHUNK;
 const int RING = 1024;          // input history per player (frames)
 const int HASH_EVERY = 120;     // frames between RAM fingerprints
-const DWORD PEER_TIMEOUT = 10000;
+const u32 PEER_TIMEOUT = 10000;
 
 enum : u8 { P_HELLO = 1, P_WELCOME, P_REJECT, P_CARD, P_NEED, P_READY, P_START, P_INPUT, P_BYE };
 
@@ -70,7 +91,9 @@ struct InputPkt {
 #pragma pack(pop)
 
 SOCKET s_sock = INVALID_SOCKET;
+#ifdef _WIN32
 WSAEVENT s_evt = WSA_INVALID_EVENT;   // signalled when a datagram arrives
+#endif
 sockaddr_in s_peer = {};
 bool s_active = false;
 int s_slot = 0, s_delay = 3;
@@ -81,11 +104,22 @@ u32 s_local_upto = 0;          // highest frame with local input scheduled
 u64 s_my_hash[64]; u32 s_my_hash_frame[64];
 u32 s_peer_hash_frame = 0; u64 s_peer_hash = 0;
 u32 s_last_hash_frame = 0;
-DWORD s_last_rx = 0;
+u32 s_last_rx = 0;
 double s_saved_cpi; bool s_saved_widescreen, s_saved_multitap;
 std::atomic<bool> s_upnp_done{false};
 std::string s_upnp_info;
 int s_port = DEFAULT_PORT;
+
+// milliseconds, wrapping (differences of two readings are what count)
+u32 now_ms() {
+#ifdef _WIN32
+    return GetTickCount();
+#else
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u32)((u64)t.tv_sec * 1000 + (u64)t.tv_nsec / 1000000);
+#endif
+}
 
 u64 fnv(const void* p, size_t n, u64 h = 1469598103934665603ull) {
     const u8* b = (const u8*)p;
@@ -115,8 +149,8 @@ template <class T> void send_peer(const T& p) { send_to(p, s_peer); }
 
 // one datagram, non-blocking; returns its size (0 = none)
 int recv_one(u8* buf, int cap, sockaddr_in& from) {
-    int fl = sizeof from;
-    int n = recvfrom(s_sock, (char*)buf, cap, 0, (sockaddr*)&from, &fl);
+    socklen_t fl = sizeof from;
+    int n = (int)recvfrom(s_sock, (char*)buf, cap, 0, (sockaddr*)&from, &fl);
     if (n < (int)sizeof(Hdr)) return 0;
     Hdr h;
     memcpy(&h, buf, sizeof h);
@@ -125,6 +159,7 @@ int recv_one(u8* buf, int cap, sockaddr_in& from) {
 bool same_addr(const sockaddr_in& a, const sockaddr_in& b) { return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port; }
 
 bool open_socket(int bind_port) {
+#ifdef _WIN32
     WSADATA wd;
     if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) return false;
     s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -135,6 +170,12 @@ bool open_socket(int bind_port) {
     BOOL off = FALSE;
     DWORD ret;
     WSAIoctl(s_sock, SIO_UDP_CONNRESET, &off, sizeof off, nullptr, 0, &ret, nullptr, nullptr);
+#else
+    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s_sock == INVALID_SOCKET) return false;
+    fcntl(s_sock, F_SETFL, fcntl(s_sock, F_GETFL, 0) | O_NONBLOCK);
+    fcntl(s_sock, F_SETFD, FD_CLOEXEC); // not inherited by the copy F9 starts
+#endif
     sockaddr_in a = {};
     a.sin_family = AF_INET;
     a.sin_port = htons((u_short)bind_port);
@@ -145,11 +186,16 @@ bool open_socket(int bind_port) {
 // waits a little while keeping the window alive; false = the user closed the window
 // sleeps until a datagram or a window message arrives (or ms pass); false = the user closed the window
 bool s_window_closed = false;
-bool idle(DWORD ms) {
+bool idle(u32 ms) {
     if (!platform_pump_messages()) { s_window_closed = true; return false; }
     if (np_status_cancelled()) return false;
+#ifdef _WIN32
     MsgWaitForMultipleObjects(1, &s_evt, FALSE, ms, QS_ALLINPUT);
     WSAResetEvent(s_evt); // recv_one drains the socket; FD_READ re-signals while data is left
+#else
+    pollfd p = {s_sock, POLLIN, 0};
+    poll(&p, 1, (int)ms);
+#endif
     return platform_pump_messages();
 }
 
@@ -163,7 +209,7 @@ std::string local_ip() {
     std::string ip = "0.0.0.0";
     if (connect(t, (sockaddr*)&a, sizeof a) == 0) {
         sockaddr_in me = {};
-        int l = sizeof me;
+        socklen_t l = sizeof me;
         getsockname(t, (sockaddr*)&me, &l);
         char b[32];
         inet_ntop(AF_INET, &me.sin_addr, b, sizeof b);
@@ -174,6 +220,12 @@ std::string local_ip() {
 }
 
 // router port forward through UPnP (best effort, background thread)
+#ifndef _WIN32
+void upnp_map(int port, bool add) {
+    std::string info = upnp_igd_forward(port, add, add ? local_ip() : std::string());
+    if (add) { s_upnp_info = info; s_upnp_done = true; plog("netplay: %s\n", info.c_str()); }
+}
+#else
 void upnp_map(int port, bool add) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IUPnPNAT* nat = nullptr;
@@ -212,6 +264,7 @@ void upnp_map(int port, bool add) {
     CoUninitialize();
     if (add) { s_upnp_info = info; s_upnp_done = true; plog("netplay: %s\n", info.c_str()); }
 }
+#endif
 
 void set_title(const char* fmt, ...) {
     char b[256];
@@ -226,10 +279,10 @@ void set_title(const char* fmt, ...) {
 
 void fail(const char* msg) {
     plog("netplay: %s\n", msg);
-    MessageBoxA(nullptr, msg, "Team Buddies online", MB_OK | MB_ICONWARNING);
+    np_message(msg, true);
 }
 
-int delay_for_rtt(DWORD rtt) {
+int delay_for_rtt(u32 rtt) {
     int d = (int)((rtt / 2.0) / 16.68 + 0.999) + 1; // one-way latency in frames + one frame of jitter margin
     return d < 2 ? 2 : d > 12 ? 12 : d;
 }
@@ -253,7 +306,7 @@ bool host_session(int port, int forced_delay, u64 disc) {
     sockaddr_in from;
     // 1. wait for a player
     bool got = false;
-    for (DWORD t0 = GetTickCount(); !got;) {
+    for (u32 t0 = now_ms(); !got;) {
         set_title("Team Buddies - Hosting on %s:%d. Router: %s. Waiting for player 2...", lan.c_str(), port,
                   s_upnp_done ? s_upnp_info.c_str() : "checking");
         while (int n = recv_one(buf, sizeof buf, from)) {
@@ -290,7 +343,7 @@ bool host_session(int port, int forced_delay, u64 disc) {
     // 2. memory cards, 3. ready/start
     const std::vector<u8>* cards[2] = {&card_image(0), &card_image(1)};
     int delay = 0;
-    DWORD last = GetTickCount();
+    u32 last = now_ms();
     while (!delay) {
         set_title("Team Buddies - Player 2 joined from %s. Sending memory cards...", peer);
         while (int n = recv_one(buf, sizeof buf, from)) {
@@ -325,9 +378,9 @@ bool host_session(int port, int forced_delay, u64 disc) {
                 memcpy(&r, buf, sizeof r);
                 delay = forced_delay > 0 ? forced_delay : r.delay;
             }
-            last = GetTickCount();
+            last = now_ms();
         }
-        if (GetTickCount() - last > PEER_TIMEOUT) { fail("Player 2 stopped responding while joining."); return false; }
+        if (now_ms() - last > PEER_TIMEOUT) { fail("Player 2 stopped responding while joining."); return false; }
         if (!delay && !idle(2)) return false;
     }
     s_delay = delay;
@@ -359,13 +412,13 @@ bool join_session(const std::string& target, int forced_delay, u64 disc) {
     u8 buf[2048];
     sockaddr_in from;
     // 1. hello until welcome; keep the best ping of a few rounds
-    DWORD best = 0xFFFFFFFF, t0 = GetTickCount(), last_hello = 0;
+    u32 best = 0xFFFFFFFF, t0 = now_ms(), last_hello = 0;
     int welcomes = 0;
     double cpi = 2.0;
     bool widescreen = false;
     while (welcomes < 5) {
         set_title("Team Buddies - Connecting to %s:%d...", hostname.c_str(), port);
-        DWORD now = GetTickCount();
+        u32 now = now_ms();
         if (now - last_hello > 150) {
             Hello hi;
             init_hdr(hi, P_HELLO);
@@ -388,7 +441,7 @@ bool join_session(const std::string& target, int forced_delay, u64 disc) {
             if (buf[4] == P_WELCOME && n >= (int)sizeof(Welcome)) {
                 Welcome w;
                 memcpy(&w, buf, sizeof w);
-                DWORD rtt = GetTickCount() - w.t_echo;
+                u32 rtt = now_ms() - w.t_echo;
                 if (rtt < best) best = rtt;
                 cpi = w.cpi;
                 widescreen = w.widescreen != 0;
@@ -396,24 +449,24 @@ bool join_session(const std::string& target, int forced_delay, u64 disc) {
                 last_hello = 0; // next ping right away
             }
         }
-        if (GetTickCount() - t0 > PEER_TIMEOUT && !welcomes) {
+        if (now_ms() - t0 > PEER_TIMEOUT && !welcomes) {
             fail("No answer from the host. Check the address, that the host is waiting, and the host's port forward / firewall.");
             return false;
         }
         if (!idle(2)) return false;
     }
     int delay = forced_delay > 0 ? forced_delay : delay_for_rtt(best);
-    plog("netplay: connected, ping %lu ms, input delay %d frames\n", best, delay);
+    plog("netplay: connected, ping %u ms, input delay %d frames\n", best, delay);
     // 2. memory cards
     static std::vector<u8> img(2 * CARD_BYTES);
     bool have[CHUNKS] = {};
     int missing = CHUNKS;
-    DWORD last_need = 0, last_rx = GetTickCount();
+    u32 last_need = 0, last_rx = now_ms();
     while (missing) {
         set_title("Team Buddies - Receiving memory cards (%d%%)...", (CHUNKS - missing) * 100 / CHUNKS);
         while (int n = recv_one(buf, sizeof buf, from)) {
             if (!same_addr(from, s_peer)) continue;
-            last_rx = GetTickCount();
+            last_rx = now_ms();
             if (buf[4] != P_CARD || n < (int)sizeof(CardChunk)) continue;
             CardChunk ch;
             memcpy(&ch, buf, sizeof ch);
@@ -423,7 +476,7 @@ bool join_session(const std::string& target, int forced_delay, u64 disc) {
                 missing--;
             }
         }
-        DWORD now = GetTickCount();
+        u32 now = now_ms();
         if (missing && now - last_need > 60) {
             Need nd;
             init_hdr(nd, P_NEED);
@@ -437,11 +490,11 @@ bool join_session(const std::string& target, int forced_delay, u64 disc) {
     card_replace(0, &img[0]);
     card_replace(1, &img[CARD_BYTES]);
     // 3. ready until start
-    DWORD last_ready = 0;
-    last_rx = GetTickCount();
+    u32 last_ready = 0;
+    last_rx = now_ms();
     for (;;) {
         set_title("Team Buddies - Waiting for the host to start...");
-        DWORD now = GetTickCount();
+        u32 now = now_ms();
         if (now - last_ready > 100) {
             Ready r;
             init_hdr(r, P_READY);
@@ -499,7 +552,7 @@ void end_session(const char* why, const char* peer_why = "the other player left"
     s_active = false;
     set_title("Team Buddies - Offline (%s)", why);
     std::string msg = std::string("Online session ended: ") + why + ".\nThe game continues offline.";
-    std::thread([msg] { MessageBoxA(nullptr, msg.c_str(), "Team Buddies online", MB_OK | MB_ICONINFORMATION); }).detach(); // the game keeps running
+    std::thread([msg] { np_message(msg.c_str(), false); }).detach(); // the game keeps running
 }
 
 void check_hashes() {
@@ -520,7 +573,7 @@ void receive() {
     sockaddr_in from;
     while (int n = recv_one(buf, sizeof buf, from)) {
         if (!same_addr(from, s_peer)) continue;
-        s_last_rx = GetTickCount();
+        s_last_rx = now_ms();
         if (buf[4] == P_BYE) {
             Bye bye;
             memset(&bye, 0, sizeof bye);
@@ -581,7 +634,7 @@ bool netplay_start(int argc, char** argv, const std::vector<u8>& exe) {
     s_active = true;
     s_frame = 0;
     s_local_upto = 0;
-    s_last_rx = GetTickCount();
+    s_last_rx = now_ms();
     // the first `delay` frames have no input from anyone yet: neutral pads
     NetInput neutral = {0, 0x80, 0x80, 0x80, 0x80};
     for (u32 f = 0; f < (u32)s_delay; f++) { store(0, f, neutral); store(1, f, neutral); }
@@ -608,7 +661,7 @@ void netplay_sync() {
     send_inputs();
     // 3. wait for the other player's input for this frame
     int other = 1 - s_slot;
-    DWORD wait_start = GetTickCount(), last_send = wait_start;
+    u32 wait_start = now_ms(), last_send = wait_start;
     bool warned = false;
     for (;;) {
         receive();
@@ -616,7 +669,7 @@ void netplay_sync() {
         check_hashes();
         if (!s_active) break;
         if (have_input(other, s_frame)) break;
-        DWORD now = GetTickCount();
+        u32 now = now_ms();
         if (now - last_send > 30) { send_inputs(); last_send = now; }
         if (now - wait_start > 1000 && !warned) { set_title("Team Buddies - Waiting for the other player..."); warned = true; }
         if (now - s_last_rx > PEER_TIMEOUT) { end_session("connection lost"); break; }
@@ -641,9 +694,9 @@ void netplay_sync() {
     static u32 corrupt_at = getenv("TB_NET_DESYNC") ? (u32)atoi(getenv("TB_NET_DESYNC")) : 0;
     if (corrupt_at && s_slot == 1 && s_frame == corrupt_at) g_ram[0x180] ^= 0x5A; // unused kernel area: harmless, but the fingerprint must differ
     s_frame++;
-    static DWORD title_at = 0;
-    if (s_active && GetTickCount() - title_at > 2000) {
-        title_at = GetTickCount();
+    static u32 title_at = 0;
+    if (s_active && now_ms() - title_at > 2000) {
+        title_at = now_ms();
         set_title("Team Buddies - Online as player %d (input delay %d frames)", s_slot + 1, s_delay);
     }
 }

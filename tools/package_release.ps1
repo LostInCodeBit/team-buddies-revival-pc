@@ -60,7 +60,11 @@ Remove-Item $stage -Recurse -Force
 
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 $sums = Join-Path $dist "SHA256SUMS.txt"
-[IO.File]::WriteAllText("$sums.tmp", "$hash  $name.zip`n", (New-Object Text.UTF8Encoding $false))
+# this zip's line replaced, the other packages' (the Linux archive, tools/package_linux.sh) kept
+$lines = @()
+if (Test-Path $sums) { $lines = @(Get-Content $sums | Where-Object { $_ -and -not $_.EndsWith("  $name.zip") }) }
+$lines += "$hash  $name.zip"
+[IO.File]::WriteAllText("$sums.tmp", (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
 Move-Item "$sums.tmp" $sums -Force
 "{0}  {1:N1} MB" -f $zip, ((Get-Item $zip).Length / 1MB)
 "$sums  $hash"

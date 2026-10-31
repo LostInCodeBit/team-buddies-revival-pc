@@ -15,6 +15,11 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#ifndef _WIN32
+#include <strings.h>
+#define _fseeki64 fseeko
+#define _strnicmp strncasecmp
+#endif
 
 typedef uint8_t u8;
 typedef uint16_t u16;

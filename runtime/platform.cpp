@@ -1,4 +1,6 @@
-// platform.cpp - Win32 window, Direct3D 11 presentation, keyboard (+ SDL3 controllers, gamepad.cpp), XAudio2, frame pacing.
+// platform.cpp - Win32 window, Direct3D 11 presentation, keyboard (+ SDL3 controllers, gamepad.cpp), XAudio2.
+// What the Linux (SDL3) platform layer shares with this one is in platform_common.cpp: logging, screenshots,
+// frame pacing, input and the hotkeys.
 #include "platform_d3d.h"
 #include <dxgi1_6.h>
 #include <xaudio2.h>
@@ -6,10 +8,8 @@
 #include <algorithm>
 #include <atomic>
 #include <timeapi.h>
-#include "psx.h"
+#include "platform_common.h"
 #include <cmath>
-#include <cstdarg>
-#include <unordered_set>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -19,66 +19,30 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "winmm.lib")
 
-std::string g_base_dir;
-std::string g_ini_path;
-
-// ---------------------------------------------------------------- logging
-static FILE* s_log;
-void plog(const char* fmt, ...) {
-    char buf[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    static size_t written = 0;
-    const size_t limit = 32u << 20; // keep the log file bounded
-    if (!s_log) s_log = fopen(getenv("TB_LOG") ? getenv("TB_LOG") : (g_base_dir + "teambuddies.log").c_str(), "w"); // TB_LOG: test harness
-    if (s_log && written < limit) {
-        written += strlen(buf);
-        fputs(written < limit ? buf : "log size limit reached, further output dropped\n", s_log);
-        fflush(s_log);
-    }
-    // only for a debugger: with another program listening for debug output (seen while Valorant ran) each call
-    // can block for seconds
-    if (IsDebuggerPresent()) OutputDebugStringA(buf);
-    fputs(buf, stdout);
-}
-void log_once(const char* key, const char* fmt, ...) {
-    static std::unordered_set<std::string> seen;
-    if (!seen.insert(key).second) return;
-    char buf[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    plog("%s", buf);
-}
-// test harness: TB_HIDDEN runs show nothing on screen, not even an error box (the log has it)
-static bool hidden_run() {
-    static const bool h = getenv("TB_HIDDEN") != nullptr;
-    return h;
-}
-
-void fatal(const char* fmt, ...) {
-    char buf[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    plog("FATAL: %s\n", buf);
-    if (!hidden_run()) MessageBoxA(nullptr, buf, "Team Buddies", MB_OK | MB_ICONERROR);
-    ExitProcess(1);
-}
-
 // ---------------------------------------------------------------- window
 static HWND s_hwnd;
-static bool s_quit;
 static bool s_fullscreen;
 static RECT s_saved_rect;
 static bool s_focus = true;
 
 void* platform_hwnd() { return s_hwnd; }
-bool platform_key(int vk) { return s_focus && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+// ---------------------------------------------------------------- hooks for platform_common.cpp
+long long plat_ticks() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+long long plat_tick_hz() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }
+void plat_sleep_ms(int ms) { Sleep((DWORD)ms); }
+void plat_yield() { YieldProcessor(); }
+// only for a debugger: with another program listening for debug output (seen while Valorant ran) each call
+// can block for seconds
+void plat_debug_out(const char* s) { if (IsDebuggerPresent()) OutputDebugStringA(s); }
+void plat_error_box(const char* s) { MessageBoxA(nullptr, s, "Team Buddies", MB_OK | MB_ICONERROR); }
+void plat_exit(int code) { ExitProcess(code); }
+bool plat_focused() { return s_focus; }
+bool plat_key(PlatKey k) {
+    static const int vk[PK_COUNT] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, 'Z', 'X', 'A', 'S', 'Q', 'W', 'E', 'R',
+                                     VK_RETURN, VK_BACK, VK_RSHIFT, VK_TAB};
+    return (GetAsyncKeyState(vk[k]) & 0x8000) != 0;
+}
 
 static void resize_swapchain();
 static void set_exclusive(bool on);
@@ -117,11 +81,9 @@ void platform_get_window_size(int& w, int& h) {
     h = r.bottom - r.top;
 }
 
-static void hotkey(WPARAM k);
-
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_CLOSE: s_quit = true; return 0;
+    case WM_CLOSE: platform_request_quit(); return 0;
     case WM_SIZE: resize_swapchain(); return 0;
     case WM_ACTIVATE:
         s_focus = LOWORD(w) != WA_INACTIVE;
@@ -130,17 +92,12 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SYSKEYDOWN:
         if (w == VK_RETURN && (l & (1 << 29))) { platform_toggle_fullscreen(); return 0; }
         if (w == VK_F10) { // F10 arrives as a system key (it would open the window menu)
-            if (!(l & (1 << 30))) { // original <-> the rate chosen in the ini (60 if none)
-                static int last_on = 60;
-                if (g_settings.frame_rate != 0) { last_on = g_settings.frame_rate; g_settings.frame_rate = 0; }
-                else g_settings.frame_rate = last_on;
-                plog("frame rate: %d (0 original, -1 monitor)\n", g_settings.frame_rate);
-            }
+            if (!(l & (1 << 30))) hotkey(10);
             return 0;
         }
         break;
     case WM_KEYDOWN:
-        if (!(l & (1 << 30))) hotkey(w);
+        if (!(l & (1 << 30)) && w >= VK_F1 && w <= VK_F12) hotkey((int)(w - VK_F1) + 1);
         return 0;
     }
     return DefWindowProc(h, m, w, l);
@@ -170,34 +127,9 @@ ID3DBlob* d3d_compile(const char* src, const char* entry, const char* target) {
     return code;
 }
 
-static const char* k_present_hlsl = R"(
-cbuffer C : register(b0) { float4 uvrect; };
-struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-VO vs_main(uint id : SV_VertexID) {
-    VO o;
-    float2 p = float2(id & 1, id >> 1);
-    o.pos = float4(p.x * 2 - 1, 1 - p.y * 2, 0, 1);
-    o.uv = lerp(uvrect.xy, uvrect.zw, p);
-    return o;
-}
-Texture2D tex : register(t0);
-SamplerState smp : register(s0);
-float4 ps_main(VO i) : SV_Target {
-    float w, h;
-    tex.GetDimensions(w, h);
-    float2 size = float2(w, h);
-    float2 fp = float2(abs(ddx(i.uv.x)), abs(ddy(i.uv.y))) * size; // source texels per screen pixel
-    if (max(fp.x, fp.y) <= 1.0) return float4(tex.SampleLevel(smp, i.uv, 0).rgb, 1); // one mip level only
-    // drawn smaller than the source (an internal resolution above the window's): average the texels each pixel
-    // covers instead of picking one, so the extra resolution (and MSAA's blended edges) smooth the picture
-    int2 n = (int2)min(ceil(fp), 4.0);
-    float3 acc = 0;
-    for (int y = 0; y < n.y; y++)
-        for (int x = 0; x < n.x; x++)
-            acc += tex.SampleLevel(smp, i.uv + (float2(x, y) + 0.5 - n * 0.5) * fp / n / size, 0).rgb; // no gradients in a loop
-    return float4(acc / (n.x * n.y), 1);
-}
-)";
+static const char* k_present_hlsl =
+#include "shaders/present_hlsl.inc"
+    ;
 
 static void create_rtv() {
     ID3D11Texture2D* bb = nullptr;
@@ -285,56 +217,6 @@ static bool d3d_init() {
     return true;
 }
 
-// ---------------------------------------------------------------- screenshots (uncompressed PNG)
-static u32 crc32_png(const u8* d, size_t n, u32 c = 0xFFFFFFFF) {
-    static u32 t[256];
-    if (!t[1]) for (u32 i = 0; i < 256; i++) { u32 x = i; for (int k = 0; k < 8; k++) x = (x >> 1) ^ (0xEDB88320 & (0 - (x & 1))); t[i] = x; }
-    for (size_t i = 0; i < n; i++) c = t[(c ^ d[i]) & 0xFF] ^ (c >> 8);
-    return c;
-}
-
-void write_png(const std::string& path, const u8* rgba, int w, int h, int pitch) {
-    std::vector<u8> raw;
-    raw.reserve((size_t)(w * 3 + 1) * h);
-    for (int y = 0; y < h; y++) {
-        raw.push_back(0);
-        const u8* row = rgba + (size_t)y * pitch;
-        for (int x = 0; x < w; x++) { raw.push_back(row[x * 4]); raw.push_back(row[x * 4 + 1]); raw.push_back(row[x * 4 + 2]); }
-    }
-    // zlib stream made of stored blocks
-    std::vector<u8> z = {0x78, 0x01};
-    u32 a = 1, b = 0;
-    for (u8 v : raw) { a = (a + v) % 65521; b = (b + a) % 65521; }
-    for (size_t p = 0; p < raw.size(); p += 65535) {
-        size_t n = std::min<size_t>(65535, raw.size() - p);
-        z.push_back(p + n >= raw.size() ? 1 : 0);
-        z.push_back((u8)n); z.push_back((u8)(n >> 8)); z.push_back((u8)~n); z.push_back((u8)(~n >> 8));
-        z.insert(z.end(), raw.begin() + p, raw.begin() + p + n);
-    }
-    u32 ad = (b << 16) | a;
-    for (int s = 24; s >= 0; s -= 8) z.push_back((u8)(ad >> s));
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return;
-    auto be32 = [&](u32 v) { u8 x[4] = {(u8)(v >> 24), (u8)(v >> 16), (u8)(v >> 8), (u8)v}; fwrite(x, 1, 4, f); };
-    auto chunk = [&](const char* type, const std::vector<u8>& data) {
-        be32((u32)data.size());
-        std::vector<u8> td(type, type + 4);
-        td.insert(td.end(), data.begin(), data.end());
-        fwrite(td.data(), 1, td.size(), f);
-        be32(~crc32_png(td.data(), td.size()));
-    };
-    const u8 sig[8] = {0x89, 'P', 'N', 'G', 13, 10, 26, 10};
-    fwrite(sig, 1, 8, f);
-    std::vector<u8> ihdr = {(u8)(w >> 24), (u8)(w >> 16), (u8)(w >> 8), (u8)w, (u8)(h >> 24), (u8)(h >> 16), (u8)(h >> 8), (u8)h, 8, 2, 0, 0, 0};
-    chunk("IHDR", ihdr);
-    chunk("IDAT", z);
-    chunk("IEND", {});
-    fclose(f);
-}
-
-static bool s_shot_request;
-static int s_shot_counter;
-
 static void capture_backbuffer() {
     ID3D11Texture2D* bb = nullptr;
     s_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
@@ -349,55 +231,16 @@ static void capture_backbuffer() {
         s_ctx->CopyResource(st, bb);
         D3D11_MAPPED_SUBRESOURCE m;
         if (SUCCEEDED(s_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
-            // TB_SHOT_DIR redirects screenshots (test harness)
-            std::string dir = getenv("TB_SHOT_DIR") ? std::string(getenv("TB_SHOT_DIR")) : g_base_dir + "screenshots";
-            CreateDirectoryA(dir.c_str(), nullptr);
-            char name[64];
-            snprintf(name, sizeof name, "\\shot_%04d.png", s_shot_counter++);
-            write_png(dir + name, (const u8*)m.pData, td.Width, td.Height, m.RowPitch);
+            shot_save((const u8*)m.pData, td.Width, td.Height, m.RowPitch);
             s_ctx->Unmap(st, 0);
-            plog("saved %s%s\n", dir.c_str(), name);
         }
         st->Release();
     }
     bb->Release();
 }
 
-// size of the picture inside a ww x wh window for the aspect setting; native_h = the game's own line count
-static void picture_size(int ww, int wh, int native_h, double& vw, double& vh) {
-    vw = ww;
-    vh = wh;
-    const double base = g_settings.widescreen ? 16.0 / 9.0 : 4.0 / 3.0;
-    double a = base;
-    switch (g_settings.aspect) {
-    case ASPECT_STRETCH: return;
-    case ASPECT_WIDE: if (!netplay_active()) return; a = 16.0 / 9.0; break; // online the 3D view is fixed at 16:9
-    case ASPECT_16_9: a = 16.0 / 9.0; break;
-    case ASPECT_PIXELS: {
-        // whole-number multiples of the game's own lines: every source pixel the same size
-        double bh = native_h > 0 ? native_h : 240, bw = bh * base;
-        int k = (int)std::min(ww / bw, wh / bh);
-        if (k >= 1) { vw = bw * k; vh = bh * k; return; }
-        break;
-    }
-    }
-    if (vw / vh > a) vw = vh * a;
-    else vh = vw / a;
-}
-
-// widescreen hack strength: 3/4 for 16:9; "wide" follows the window's shape (offline only, it changes the 3D maths)
-static void update_widescreen_factor(int ww, int wh) {
-    int q = 49152;
-    if (g_settings.aspect == ASPECT_WIDE && !netplay_active() && wh > 0)
-        q = std::clamp((int)(65536.0 * (4.0 / 3.0) / ((double)ww / wh)), 16384, 65536);
-    g_gpu_widescreen_q16 = q;
-}
-
-static int s_sync_interval = 1; // refreshes per present with vsync (the unlocked frame rate caps with it)
-static LONGLONG s_present_wait;  // QPC ticks the last Present call took (it waits while the frame before is queued)
-
 void d3d_present_texture(ID3D11ShaderResourceView* srv, float u0, float v0, float u1, float v1, int src_w, int src_h, int native_h, bool enabled) {
-    s_sync_interval = 1;
+    g_sync_interval = 1;
     d3d_show(srv, u0, v0, u1, v1, src_w, src_h, native_h, enabled);
     platform_frame_pace();
     platform_pump();
@@ -438,28 +281,12 @@ bool d3d_show(ID3D11ShaderResourceView* srv, float u0, float v0, float u1, float
         ID3D11ShaderResourceView* none = nullptr;
         s_ctx->PSSetShaderResources(0, 1, &none);
     }
-    // F12, or every N frames when TB_SHOT_EVERY is set (debugging aid)
-    static int every = getenv("TB_SHOT_EVERY") ? atoi(getenv("TB_SHOT_EVERY")) : 0;
-    static int frame = 0;
-    static std::vector<int> at; // TB_SHOT_AT="1650,2000,4250": screenshots at those frames
-    static bool at_parsed = false;
-    if (!at_parsed) {
-        at_parsed = true;
-        if (const char* s = getenv("TB_SHOT_AT")) for (const char* p = s; *p; p += *p == ',') at.push_back((int)strtol(p, (char**)&p, 10));
-    }
-    ++frame;
-    bool shot_at = std::find(at.begin(), at.end(), frame) != at.end();
-    // TB_SHOT_VBLANK="7000:16": the first 16 presents from vblank 7000 on (in-between frames included)
-    static long long sv_from = -1, sv_left = 0;
-    if (sv_from < 0) { const char* e = getenv("TB_SHOT_VBLANK"); sv_from = 0; if (e) sscanf(e, "%lld:%lld", &sv_from, &sv_left); }
-    extern u64 g_dbg_frames;
-    if (sv_left > 0 && (long long)g_dbg_frames >= sv_from) { shot_at = true; sv_left--; }
-    if (s_shot_request || shot_at || (every > 0 && frame % every == 0)) { s_shot_request = false; capture_backbuffer(); }
+    if (shot_due()) capture_backbuffer();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
-    HRESULT pr = s_swap->Present(g_settings.vsync ? s_sync_interval : 0, 0);
+    HRESULT pr = s_swap->Present(g_settings.vsync ? g_sync_interval : 0, 0);
     QueryPerformanceCounter(&p1);
-    s_present_wait = p1.QuadPart - p0.QuadPart;
+    g_present_wait = p1.QuadPart - p0.QuadPart;
     if (pr == DXGI_ERROR_DEVICE_REMOVED || pr == DXGI_ERROR_DEVICE_RESET) // driver crash/update: tell the user instead of freezing
         fatal("The graphics device was lost (driver reset or GPU removed, reason %08lX).\nPlease restart the game.",
               (unsigned long)s_dev->GetDeviceRemovedReason());
@@ -493,26 +320,6 @@ void platform_present_image(const u32* rgba, int w, int h, int stride, bool enab
     d3d_present_texture(s_sw_srv, 0, 0, 1, 1, w, h, h, enabled);
 }
 
-// ---------------------------------------------------------------- pacing
-static LARGE_INTEGER s_freq, s_next;
-static bool s_fast;
-
-void platform_frame_pace() {
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_next); timeBeginPeriod(1); }
-    if (s_fast) { QueryPerformanceCounter(&s_next); return; }
-    double hz = (double)CPU_HZ / (double)CYCLES_PER_FRAME;
-    s_next.QuadPart += (LONGLONG)(s_freq.QuadPart / hz);
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart > s_next.QuadPart + s_freq.QuadPart / 10) { s_next = now; return; } // fell behind
-    while (now.QuadPart < s_next.QuadPart) {
-        LONGLONG left = (s_next.QuadPart - now.QuadPart) * 1000 / s_freq.QuadPart;
-        if (left > 2) Sleep((DWORD)(left - 1));
-        else YieldProcessor();
-        QueryPerformanceCounter(&now);
-    }
-}
-
 // refresh rate of the monitor the window is on (checked at most once a second)
 int platform_refresh_hz() {
     static int hz = 60;
@@ -530,237 +337,16 @@ int platform_refresh_hz() {
     return hz;
 }
 
-// Unlocked frame rate: between this vblank and its deadline, show as many frames as the cap (fps, or the
-// monitor's rate when fps < 0) allows. draw(frac) draws and presents the picture for the moment `frac` (0..1]
-// of the way from the previous vblank to this one; it returns false if it could not. With vsync the monitor
-// paces the presents (every Nth refresh for a cap that divides its rate); any other cap is kept by spacing the
-// presents in time, across vblanks, so 144 or 165 average out right although they don't divide 60.
-void platform_present_unlocked(int fps, bool (*draw)(double frac)) {
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_next); timeBeginPeriod(1); }
-    if (s_fast) {
-        // fast-forward and the test harness: no waiting; TB_UNLOCKED_STEPS=n shows n evenly spaced moments
-        static int steps = getenv("TB_UNLOCKED_STEPS") ? std::clamp(atoi(getenv("TB_UNLOCKED_STEPS")), 1, 16) : 1;
-        for (int i = 1; i <= steps; i++) if (!draw((double)i / steps)) break;
-        QueryPerformanceCounter(&s_next);
-        platform_pump();
-        return;
-    }
-    const double vhz = (double)CPU_HZ / (double)CYCLES_PER_FRAME;
-    const LONGLONG period = (LONGLONG)(s_freq.QuadPart / vhz);
-    LONGLONG start = s_next.QuadPart; // the previous deadline: frac 0
-    s_next.QuadPart += period;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart > s_next.QuadPart + s_freq.QuadPart / 10) { s_next = now; start = now.QuadPart - period; } // fell behind
-    const int hz = platform_refresh_hz();
-    const bool vs = g_settings.vsync;
-    const int cap = fps > 0 ? fps : hz;
-    const double per = (double)hz / cap; // refreshes per frame
-    const int whole = std::clamp((int)std::lround(per), 1, 4);
-    s_sync_interval = vs && std::fabs(per - whole) < 0.05 ? whole : 1;
-    const bool timed = !vs || s_sync_interval * cap < hz * 0.95; // vsync alone would show more than the cap
-    const LONGLONG refresh = s_freq.QuadPart * s_sync_interval / hz; // between shown frames, with vsync
-    const LONGLONG gap = s_freq.QuadPart / cap;
-    static LONGLONG next_free = 0;  // earliest time for the next present (timed); carries over between vblanks
-    static LONGLONG prev_shown = 0; // with vsync: the refresh that puts up the previous frame
-    for (int shown_n = 0;;) {
-        QueryPerformanceCounter(&now);
-        const LONGLONG at = timed ? std::max(next_free, now.QuadPart) : now.QuadPart;
-        // with vsync a present waits until the frame before it is up. One that would still be waiting (or not yet
-        // due) at the next vblank belongs to that vblank, but every vblank shows at least one.
-        const bool late = (vs ? std::max(at, prev_shown) : at) >= s_next.QuadPart;
-        if (late && shown_n) break;
-        if (!late && at > now.QuadPart) {
-            LONGLONG ms = (at - now.QuadPart) * 1000 / s_freq.QuadPart;
-            if (ms > 1) Sleep((DWORD)(ms - 1));
-            else YieldProcessor();
-            continue;
-        }
-        // the moment it reaches the screen: right away without vsync; with it, the first refresh after both now
-        // and the previous frame's (counting refreshes from that one)
-        LONGLONG shown = now.QuadPart;
-        if (vs && prev_shown > 0) shown = prev_shown + std::max<LONGLONG>(1, (now.QuadPart - prev_shown + refresh - 1) / refresh) * refresh;
-        // with vsync the picture runs a refresh behind: one put up as late as a refresh after the next vblank
-        // still has its frame (frac can then go below 0, into the previous vblank)
-        double frac = std::clamp((double)(shown - (vs ? refresh : 0) - start) / (double)period, -1.0, 1.0);
-        const LONGLONG t_draw = now.QuadPart;
-        if (!draw(frac)) break;
-        shown_n++;
-        QueryPerformanceCounter(&now);
-        // a present that had to wait returned as the previous frame went up: anchor on that refresh
-        const bool waited = s_present_wait > s_freq.QuadPart / 1000;
-        if (vs) prev_shown = waited ? now.QuadPart + refresh : shown;
-        static int pace_log = getenv("TB_PACE_LOG") ? atoi(getenv("TB_PACE_LOG")) : 0; // debug: the first n presents
-        if (pace_log > 0) {
-            pace_log--;
-            auto ms = [&](LONGLONG t) { return (double)t * 1000.0 / (double)s_freq.QuadPart; };
-            plog("pace: at %.2f ms, +%.2f ms in vblank, draw %.2f + present %.2f ms, %.2f ms left, shown at %.2f -> %.2f, frac %.3f, interval %d\n",
-                 ms(now.QuadPart), ms(t_draw - start), ms(now.QuadPart - t_draw - s_present_wait), ms(s_present_wait),
-                 ms(s_next.QuadPart - now.QuadPart), ms(shown), ms(vs ? prev_shown : shown), frac, s_sync_interval);
-        }
-        next_free = std::max(next_free + gap, now.QuadPart);
-    }
-    while (now.QuadPart < s_next.QuadPart) {
-        LONGLONG ms = (s_next.QuadPart - now.QuadPart) * 1000 / s_freq.QuadPart;
-        if (ms > 2) Sleep((DWORD)(ms - 1));
-        else YieldProcessor();
-        QueryPerformanceCounter(&now);
-    }
-    platform_pump();
-}
-
-// ---------------------------------------------------------------- input
-static void hotkey(WPARAM k);
-
-static void poll_input() {
-    for (int p = 0; p < 4; p++) { g_pads[p].buttons = 0; g_pads[p].connected = false; g_pads[p].lx = g_pads[p].ly = g_pads[p].rx = g_pads[p].ry = 0x80; }
-    g_pads[0].connected = true; // keyboard is always player 1
-    if (s_focus) {
-        struct { int vk; u16 b; } km[] = {
-            {VK_UP, PAD_UP}, {VK_DOWN, PAD_DOWN}, {VK_LEFT, PAD_LEFT}, {VK_RIGHT, PAD_RIGHT},
-            {'Z', PAD_CROSS}, {'X', PAD_CIRCLE}, {'A', PAD_SQUARE}, {'S', PAD_TRIANGLE},
-            {'Q', PAD_L1}, {'W', PAD_R1}, {'E', PAD_L2}, {'R', PAD_R2},
-            {VK_RETURN, PAD_START}, {VK_BACK, PAD_SELECT}, {VK_RSHIFT, PAD_SELECT},
-        };
-        for (auto& k : km) if (GetAsyncKeyState(k.vk) & 0x8000) g_pads[0].buttons |= k.b;
-    }
-    // button prompts follow whichever device was used last (or the ini choice)
-    static u16 prev_kb = 0;
-    const u16 kb = g_pads[0].buttons; // keyboard only, controllers are added below
-    bool kb_used = (kb & ~prev_kb) != 0;
-    prev_kb = kb;
-    // controllers (SDL3); the first one shares player 1 with the keyboard
-    int pad_family = gamepad_poll(0);
-    switch (g_settings.button_icons) {
-    case 1: g_input_device = DEV_PLAYSTATION; break;
-    case 2: g_input_device = DEV_XBOX; break;
-    case 3: g_input_device = DEV_KEYBOARD; break;
-    default: {
-        static bool first = true; // before any input: the controller if one is plugged in, else the keyboard
-        if (first) { first = false; int f = gamepad_first_family(); g_input_device = f >= 0 ? (InputDevice)f : DEV_KEYBOARD; }
-        if (kb_used) g_input_device = DEV_KEYBOARD;
-        else if (pad_family >= 0) g_input_device = (InputDevice)pad_family;
-    }
-    }
-    // test harness: run unthrottled; TB_TURBO=n (n > 1) only until vblank n, then at real speed
-    static long long turbo_until = getenv("TB_TURBO") ? std::max(1LL, atoll(getenv("TB_TURBO"))) : 0;
-    extern u64 g_dbg_frames;
-    const bool turbo = turbo_until == 1 || (long long)g_dbg_frames < turbo_until;
-    s_fast = !netplay_active() && (turbo || (s_focus && (GetAsyncKeyState(VK_TAB) & 0x8000))); // online: both run at real speed
-
-    // scripted input for automated testing: TB_INPUT="600=start;640=;900=cross" (pad 1), TB_INPUT2 (pad 2)
-    static std::vector<std::pair<int, u16>> script[2];
-    static bool parsed = false;
-    static int frame = 0;
-    if (!parsed) {
-        parsed = true;
-        static const struct { const char* n; u16 b; } bn[] = {
-            {"up", PAD_UP}, {"down", PAD_DOWN}, {"left", PAD_LEFT}, {"right", PAD_RIGHT}, {"cross", PAD_CROSS},
-            {"circle", PAD_CIRCLE}, {"square", PAD_SQUARE}, {"triangle", PAD_TRIANGLE}, {"start", PAD_START},
-            {"select", PAD_SELECT}, {"l1", PAD_L1}, {"r1", PAD_R1}, {"l2", PAD_L2}, {"r2", PAD_R2}};
-        const char* vars[2] = {"TB_INPUT", "TB_INPUT2"};
-        for (int pad = 0; pad < 2; pad++) {
-            const char* s = getenv(vars[pad]);
-            if (!s) continue;
-            std::string all = s;
-            size_t p = 0;
-            while (p < all.size()) {
-                size_t e = all.find(';', p);
-                std::string item = all.substr(p, e == std::string::npos ? std::string::npos : e - p);
-                p = e == std::string::npos ? all.size() : e + 1;
-                size_t eq = item.find('=');
-                if (eq == std::string::npos) continue;
-                u16 b = 0;
-                std::string names = item.substr(eq + 1) + "+";
-                for (size_t q = 0, r; (r = names.find('+', q)) != std::string::npos; q = r + 1)
-                    for (auto& x : bn) if (names.substr(q, r - q) == x.n) b |= x.b;
-                script[pad].push_back({atoi(item.c_str()), b});
-            }
-        }
-    }
-    frame++;
-    static int quit_at = getenv("TB_FRAMES") ? atoi(getenv("TB_FRAMES")) : 0;
-    if (quit_at > 0 && frame >= quit_at) s_quit = true;
-    // TB_KEYS="6400=F1;6500=F3": function keys pressed at those frames (test harness)
-    static std::vector<std::pair<int, int>> keys;
-    static bool keys_parsed = false;
-    if (!keys_parsed) {
-        keys_parsed = true;
-        if (const char* e = getenv("TB_KEYS"))
-            for (const char* p = e; *p;) {
-                int f = 0, n = 0;
-                if (sscanf(p, "%d=F%d", &f, &n) == 2 && n >= 1 && n <= 12) keys.push_back({f, n});
-                p = strchr(p, ';');
-                if (!p) break;
-                p++;
-            }
-    }
-    for (auto& k : keys) if (k.first == frame) hotkey(VK_F1 + k.second - 1);
-    for (int pad = 0; pad < 2; pad++) {
-        if (script[pad].empty()) continue;
-        u16 sb = 0;
-        for (auto& e : script[pad]) if (frame >= e.first) sb = e.second;
-        // the script replaces the real devices: a plugged-in controller (stick drift) must not change a test run
-        g_pads[pad].connected = true;
-        g_pads[pad].buttons = sb;
-        g_pads[pad].lx = g_pads[pad].ly = g_pads[pad].rx = g_pads[pad].ry = 0x80;
-    }
-    // skip_intro: tap Start while the boot logos and intro movies (24-bit MDEC frames) play. Ends once a
-    // non-movie screen has stayed up for 7 s after a movie (the title), or 60 s after boot. Online the taps
-    // are this player's own input, so both games see them.
-    static int intro_phase = g_settings.skip_intro ? 0 : 2, intro_quiet = 0, intro_tick = 0; // 0 before, 1 in movies, 2 done
-    if (intro_phase < 2) {
-        DisplayInfo d = gpu_display();
-        if (d.depth24 && d.enabled) {
-            intro_phase = 1;
-            intro_quiet = 0;
-            if (intro_tick++ % 16 < 6) g_pads[0].buttons |= PAD_START;
-        } else if ((intro_phase == 1 && ++intro_quiet > 420) || frame > 3600) {
-            intro_phase = 2;
-        }
-    }
-    netplay_sync(); // online: replaces the pads with both players' input for this frame
-}
-
-static void hotkey(WPARAM k) {
-    switch (k) {
-    case VK_F11: platform_toggle_fullscreen(); break;
-    case VK_F12: s_shot_request = true; break;
-    case VK_F9: netplay_dialog(); break;
-    case VK_F2: if (g_settings.scale > 1) g_settings.scale--; plog("internal resolution x%d\n", g_settings.scale); break;
-    case VK_F3: if (g_settings.scale < 8) g_settings.scale++; plog("internal resolution x%d\n", g_settings.scale); break;
-    case VK_F4: if (netplay_active()) break; // changes the 3D maths: both players must match
-        g_settings.widescreen = !g_settings.widescreen; g_gpu_widescreen_hack = g_settings.widescreen; break;
-    case VK_F5: g_settings.bilinear = !g_settings.bilinear; break;
-    case VK_F6: {
-        static const char* names[ASPECT_COUNT] = {"4:3", "16:9", "stretch", "wide", "pixels"};
-        g_settings.aspect = (g_settings.aspect + 1) % ASPECT_COUNT;
-        plog("aspect %s\n", names[g_settings.aspect]);
-        break;
-    }
-    case VK_F1:
-        g_settings.anti_aliasing = (g_settings.anti_aliasing + 1) % AA_COUNT;
-        plog("anti-aliasing %s\n", k_aa_names[g_settings.anti_aliasing]);
-        break;
-    case VK_F7:
-        g_settings.texture_filter = (g_settings.texture_filter + 1) % TEX_COUNT;
-        plog("texture filtering %s\n", k_tex_filter_names[g_settings.texture_filter]);
-        break;
-    case VK_F8: g_settings.true_color = !g_settings.true_color; break;
-    }
-}
-
 bool platform_pump_messages() {
     MSG msg;
     while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    return !s_quit;
+    return !platform_quit_requested();
 }
 
 void platform_set_title(const char* text) { if (s_hwnd) SetWindowTextA(s_hwnd, text); }
-void platform_request_quit() { s_quit = true; }
 
 bool platform_pump() {
     MSG msg;
@@ -769,14 +355,8 @@ bool platform_pump() {
         DispatchMessage(&msg);
     }
     poll_input();
-    if (s_quit) {
-        netplay_shutdown();
-        settings_save(g_ini_path);
-        gamepad_shutdown(); // stops rumble
-        plog("quit\n");
-        ExitProcess(0);
-    }
-    return !s_quit;
+    platform_quit_if_requested();
+    return true;
 }
 
 // ---------------------------------------------------------------- audio
@@ -877,7 +457,7 @@ void platform_audio_push(const s16* stereo, int frames) {
             s_afill = 0;
             XAUDIO2_VOICE_STATE vs;
             s_src->GetState(&vs, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-            if (vs.BuffersQueued < 8 && !s_fast) {
+            if (vs.BuffersQueued < 8 && !platform_fast()) {
                 XAUDIO2_BUFFER b = {};
                 b.AudioBytes = AUDIO_FRAMES * 4;
                 b.pAudioData = (const BYTE*)s_abuf[s_abuf_i];
@@ -1000,6 +580,7 @@ void platform_start_watchdog() {
 // ---------------------------------------------------------------- init
 bool platform_init() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    timeBeginPeriod(1); // 1 ms Sleep for the frame pacing
     gamepad_init();
     WNDCLASSA wc = {};
     wc.lpfnWndProc = wndproc;
