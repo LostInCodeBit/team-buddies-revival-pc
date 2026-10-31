@@ -2,6 +2,7 @@
 
 # build output: TeamBuddies.exe holds the translated game code (it ships only in release zips)
 /build/
+/build-linux/
 # recompiler output: the game's program translated to C++
 /generated/
 # files extracted from the disc

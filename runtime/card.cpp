@@ -13,9 +13,7 @@
 #include <fstream>
 #include <map>
 #include <set>
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "files.h"
 
 static const char* const kGameCode = "SLUS-00869";
 static const int FRAME = 128, BLOCK = 8192, CARD_SIZE = 128 * 1024, SYNC_DELAY = 30; // vblanks
@@ -159,19 +157,14 @@ static bool write_atomic(const std::string& p, const std::vector<u8>& data) {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         f.write((const char*)data.data(), data.size());
         f.flush();
-        if (!f) { f.close(); DeleteFileA(tmp.c_str()); return false; }
+        if (!f) { f.close(); file_delete(tmp); return false; }
     }
-    return MoveFileExA(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-}
-
-static void make_dirs(const std::string& dir) {
-    for (size_t i = 3; i <= dir.size(); i++)
-        if (i == dir.size() || dir[i] == '\\' || dir[i] == '/') CreateDirectoryA(dir.substr(0, i).c_str(), nullptr);
+    return file_move(tmp, p, MOVE_DURABLE);
 }
 
 static void to_backup(const std::string& dir, const std::string& file) {
-    make_dirs(dir + "\\backup");
-    MoveFileExA((dir + "\\" + file).c_str(), (dir + "\\backup\\" + file).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    make_dirs(dir + PATH_SEP "backup");
+    file_move(dir + PATH_SEP + file, dir + PATH_SEP "backup" PATH_SEP + file, MOVE_ANY_VOLUME);
 }
 
 // card image -> files: changed saves rewritten, saves the game deleted moved to backup
@@ -185,7 +178,7 @@ static void sync(int s) {
     make_dirs(sl.dir);
     std::set<std::string> now;
     for (const Save& v : saves) {
-        std::string file = encode(v.name) + ".bin", path = sl.dir + "\\" + file;
+        std::string file = encode(v.name) + ".bin", path = sl.dir + PATH_SEP + file;
         now.insert(v.name);
         std::vector<u8> old;
         bool had = read_file(path, old);
@@ -195,7 +188,7 @@ static void sync(int s) {
             std::string tmp = path + ".new";
             if (!write_atomic(tmp, v.data)) { plog("card %d: cannot write %s\n", s + 1, path.c_str()); continue; }
             to_backup(sl.dir, file);
-            MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            file_move(tmp, path, MOVE_DURABLE);
         } else if (!write_atomic(path, v.data)) {
             plog("card %d: cannot write %s\n", s + 1, path.c_str());
             continue;
@@ -215,22 +208,16 @@ static void sync(int s) {
 static void load(int s) {
     Slot& sl = s_slot[s];
     std::vector<Save> saves;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA((sl.dir + "\\*.bin").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::string file = fd.cFileName, name = decode(file.substr(0, file.size() - 4));
-            Save v;
-            v.name = name;
-            if (name.empty() || name.size() > 20 || !read_file(sl.dir + "\\" + file, v.data)) continue;
-            if (v.data.empty() || v.data.size() % BLOCK || v.data.size() > 15u * BLOCK) {
-                plog("card %d: %s is not a save (size %u), ignored\n", s + 1, file.c_str(), (unsigned)v.data.size());
-                continue;
-            }
-            saves.push_back(std::move(v));
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
+    for (const std::string& file : list_files(sl.dir, ".bin")) {
+        std::string name = decode(file.substr(0, file.size() - 4));
+        Save v;
+        v.name = name;
+        if (name.empty() || name.size() > 20 || !read_file(sl.dir + PATH_SEP + file, v.data)) continue;
+        if (v.data.empty() || v.data.size() % BLOCK || v.data.size() > 15u * BLOCK) {
+            plog("card %d: %s is not a save (size %u), ignored\n", s + 1, file.c_str(), (unsigned)v.data.size());
+            continue;
+        }
+        saves.push_back(std::move(v));
     }
     std::sort(saves.begin(), saves.end(), [](const Save& a, const Save& b) { return a.name < b.name; });
     size_t placed = build(sl.img, saves);
@@ -252,13 +239,13 @@ static bool migrate(int s, const std::string& root, const std::string& mcd) {
     if (!parse(img, saves, bad)) return false;
     for (const Save& v : saves) {
         std::string code = v.name.size() >= 12 ? v.name.substr(2, 10) : "unknown";
-        std::string dir = root + "\\" + encode(code) + (s ? "\\card2" : "");
+        std::string dir = root + PATH_SEP + encode(code) + (s ? PATH_SEP "card2" : "");
         make_dirs(dir);
-        std::string path = dir + "\\" + encode(v.name) + ".bin";
-        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) continue; // never overwrite a save already split out
+        std::string path = dir + PATH_SEP + encode(v.name) + ".bin";
+        if (path_exists(path)) continue; // never overwrite a save already split out
         if (!write_atomic(path, v.data)) return false;
     }
-    MoveFileExA(mcd.c_str(), (mcd + ".migrated").c_str(), MOVEFILE_REPLACE_EXISTING);
+    file_move(mcd, mcd + ".migrated");
     plog("card %d: %s split into %d save files under %s\n", s + 1, mcd.c_str(), (int)saves.size(), root.c_str());
     return true;
 }
@@ -267,9 +254,9 @@ void card_init(const std::string& root, const std::string& legacy_dir) {
     for (int s = 0; s < 2; s++) {
         Slot& sl = s_slot[s];
         sl = Slot();
-        sl.dir = root + "\\" + kGameCode + (s ? "\\card2" : "");
-        std::string mcd = legacy_dir + "\\card" + std::to_string(s + 1) + ".mcd";
-        if (GetFileAttributesA(mcd.c_str()) != INVALID_FILE_ATTRIBUTES && !migrate(s, root, mcd)) {
+        sl.dir = root + PATH_SEP + kGameCode + (s ? PATH_SEP "card2" : "");
+        std::string mcd = legacy_dir + PATH_SEP "card" + std::to_string(s + 1) + ".mcd";
+        if (path_exists(mcd) && !migrate(s, root, mcd)) {
             // unreadable old card: keep using it exactly as before rather than lose anything
             if (read_file(mcd, sl.img) && sl.img.size() == CARD_SIZE) {
                 sl.legacy = mcd;

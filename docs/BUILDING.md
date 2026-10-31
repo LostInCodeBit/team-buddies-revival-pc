@@ -14,14 +14,34 @@ build.bat launcher   :: rebuild only the launcher
 ```
 
 Set `DISC=path\to\game.cue` to use another location for the disc image. The result is in `build\`
-(`TeamBuddiesLauncher.exe`, `TeamBuddies.exe`, `SDL3.dll`).
+(`TeamBuddiesLauncher.exe`, `TeamBuddies.exe`, `SDL3.dll`). `build.bat sdl` makes `build\TeamBuddiesSDL.exe`,
+a test build of the Linux code paths (SDL3 platform layer, Vulkan renderer) on Windows; it is not shipped.
+
+**Linux:** GCC or Clang (C++17) and SDL 3.4 (`pkg-config sdl3`, or `SDL3_DIR` = its install prefix, whose
+`libSDL3.so.0` is then copied next to the game). The window, sound, controllers and the Vulkan renderer (SDL
+GPU) come from SDL3; there is no launcher.
+
+```
+./build.sh            # recompile from "../Team Buddies.cue" and build everything
+./build.sh runtime    # rebuild only the runtime
+```
+
+`DISC`, `OUT` (default `build-linux/`), `CXX` and `JOBS` can be set. The game links its C++ runtime in and
+finds `libSDL3.so.0` next to itself, so the build folder runs as it is.
+
+**Shaders:** `runtime/shaders/*.hlsl` are the one source of both renderers. After editing them run
+`python tools/build_shaders.py`: it writes the HLSL includes that Direct3D 11 compiles at start and the
+SPIR-V for Vulkan (`runtime/sdl/shaders_spirv.inc`), with DXC (SPIR-V support; `DXC` = its path). The outputs
+are committed, so building needs no shader compiler.
 
 ## Layout
 
 | Folder | What it is |
 |---|---|
 | `recomp/` | The recompiler: reads the executables from the disc image and writes C++ to `generated/` |
-| `runtime/` | Native replacement of the PS1 hardware and kernel, Direct3D 11 renderer, input, audio |
+| `runtime/` | Native replacement of the PS1 hardware and kernel, renderers, input, audio; the Win32 / Direct3D 11 platform |
+| `runtime/sdl/` | The SDL3 platform (Linux): window, audio, input, Vulkan presenter and renderer, online dialogs, UPnP |
+| `runtime/shaders/` | The renderers' HLSL (`gpu.hlsl`, `present.hlsl`) and what `tools/build_shaders.py` makes of it |
 | `launcher/` | `TeamBuddiesLauncher.exe`: settings, disc choice, patch notes and Play (Direct2D) |
 | `server/` | `tbmatch`, a matchmaking and relay server for online play (build line at the top of `tbmatch.cpp`) |
 | `tools/` | Small helpers (disc file lister/extractor, icon, HD text catalogue, release package) |
@@ -53,3 +73,7 @@ so the same input gives the same fingerprints whatever the graphics settings.
 `dist\TeamBuddies-0.2.0-win.zip` (launcher, game, `SDL3.dll`, `README.txt`, `CHANGELOG.md`, `LICENSE`,
 `licenses\`) and `dist\SHA256SUMS.txt`. It copies an explicit list of files, so settings, logs, saves,
 debug files and anything from the disc never end up in it. Upload both to a GitHub release.
+
+On Linux, `tools/package_linux.sh 0.2.0 <source url>` does the same from `build-linux/` (or `OUT`):
+`dist/TeamBuddies-0.2.0-linux-x86_64.tar.gz` (game, `libSDL3.so.0`, `README.txt`, docs, licences), and its
+line in `dist/SHA256SUMS.txt` next to the Windows zip's.

@@ -5,6 +5,19 @@
 #include <string>
 #include <vector>
 
+#ifndef PATH_SEP
+#ifdef _WIN32
+#define PATH_SEP "\\"
+#else
+#define PATH_SEP "/"
+#endif
+#endif
+#ifndef _WIN32
+#include <strings.h>
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#endif
+
 // ------------------------------------------------------------------ logging
 void plog(const char* fmt, ...);
 void log_once(const char* key, const char* fmt, ...);
@@ -150,7 +163,9 @@ void interp_rec_fill(int x, int y, int w, int h, u32 color);
 void interp_flip(const DisplayInfo& d);    // the game showed a new frame (display start changed)
 bool interp_present(const DisplayInfo& d);  // at vblank: true if an in-between frame was shown
 Renderer* renderer_create_software(u16* vram);
-Renderer* renderer_create_d3d11(u16* vram);
+Renderer* renderer_create_d3d11(u16* vram);   // Windows (gpu_d3d11.cpp)
+Renderer* renderer_create_sdlgpu(u16* vram);  // SDL3 GPU: Vulkan on Linux (sdl/gpu_sdlgpu.cpp)
+Renderer* renderer_create_hardware(u16* vram); // the platform's GPU renderer when renderer = hardware, else nullptr
 
 // ------------------------------------------------------------------ cdrom
 bool cd_open(const std::string& cue);
@@ -215,7 +230,7 @@ int platform_audio_queued();         // frames waiting to be played
 void* platform_hwnd();
 void platform_get_window_size(int& w, int& h);
 void platform_toggle_fullscreen();
-bool platform_key(int vk);
+void platform_present_image(const u32* rgba, int w, int h, int stride, bool enabled); // a CPU-made picture (software renderer, 24-bit movies)
 extern Renderer* g_renderer;
 extern std::string g_base_dir;
 extern std::string g_ini_path; // teambuddies.ini, or TB_INI (test harness)

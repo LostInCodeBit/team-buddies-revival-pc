@@ -1,0 +1,356 @@
+// gpu.hlsl - the hardware renderer's shaders, one source for both renderers: Direct3D 11 (gpu_d3d11.cpp compiles
+// it at start, from gpu_hlsl.inc) and SDL GPU (sdl/gpu_sdlgpu.cpp, SPIR-V from sdl/shaders_spirv.inc). After
+// editing, run tools/build_shaders.py: it writes both .inc files.
+#ifdef __spirv__
+// SDL GPU: textures are texture-sampler pairs in set 2, numbered like the D3D11 registers; the constants are in
+// set 3 for pixel shaders and set 1 for vertex shaders (built with VERTEX defined)
+#define SLOT(n) [[vk::combinedImageSampler]] [[vk::binding(n, 2)]]
+#ifdef VERTEX
+#define CBUFFER [[vk::binding(0, 1)]] cbuffer
+#else
+#define CBUFFER [[vk::binding(0, 3)]] cbuffer
+#endif
+#else
+#define SLOT(n)
+#define CBUFFER cbuffer
+#endif
+CBUFFER Draw : register(b0) {
+    int pass_mode;     // 0 = all texels, 1 = opaque texels only, 2 = semi-transparent texels only
+    float src_factor;
+    int scale;
+    int true_color;
+    float4 rect;       // upload/fill: x0 y0 x1 y1 in render target pixels
+    float4 fill_color;
+    int filter;        // bilinear texture filtering
+    int samples;       // samples per pixel of the render target (MSAA / SSAA)
+    int2 copy_off;     // copies: source position minus destination position, render target pixels
+};
+SLOT(0) Texture2D<float4> vram : register(t0);
+SLOT(2) Texture2D<float4> icons : register(t2);   // button glyph atlas, premultiplied (icon_atlas.cpp)
+#ifndef __spirv__
+Texture2DMS<float4> vram_ms : register(t3); // the render target when multisampled (SDL GPU resolves in its passes)
+#endif
+SLOT(4) Texture2D<float4> picture : register(t4); // FXAA input
+SLOT(5) Texture2D<float2> glyphs : register(t5);  // HD letters (hd_text.cpp): coverage, opacity
+static const float HD_K = 12.0, HD_PAD = 1.0, HD_ATLAS = 4096.0; // HD_TEXT_K, HD_TEXT_PAD (psx.h), GLYPH_ATLAS
+#ifdef __spirv__
+SLOT(0) SamplerState vram_smp;
+SLOT(2) SamplerState icon_smp;
+SLOT(4) SamplerState picture_smp;
+SLOT(5) SamplerState glyphs_smp;
+#define PICTURE_SMP picture_smp
+#define GLYPHS_SMP glyphs_smp
+#else
+SamplerState icon_smp : register(s0);
+SamplerState lin_smp : register(s1);
+#define PICTURE_SMP lin_smp
+#define GLYPHS_SMP lin_smp
+#endif
+
+// box: the texels the primitive uses (u0 v0 u1 v1); filters read no neighbours outside it, so a letter never
+// picks up the edge of the next one in the font
+struct VSIn { float2 pos : POSITION; float4 col : COLOR; float2 uv : TEXCOORD; uint2 attr : ATTR; uint4 box : BOX; };
+struct VSOut { float4 pos : SV_Position; float4 col : COLOR; float2 uv : TEXCOORD0; nointerpolation uint2 attr : ATTR; nointerpolation uint4 box : BOX; };
+// SSAA builds this file with PER_SAMPLE: colours and texture coordinates are taken at every sample. Otherwise
+// at the centroid of the covered samples, so a pixel on a polygon's edge (MSAA) never reads texels from outside it.
+#ifdef PER_SAMPLE
+#define AA_AT sample
+#else
+#define AA_AT centroid
+#endif
+struct PSIn { float4 pos : SV_Position; AA_AT float4 col : COLOR; AA_AT float2 uv : TEXCOORD0; nointerpolation uint2 attr : ATTR; nointerpolation uint4 box : BOX; };
+
+VSOut vs_main(VSIn i) {
+    VSOut o;
+    o.pos = float4(i.pos.x / 512.0 - 1.0, 1.0 - i.pos.y / 256.0, 0, 1);
+    o.col = i.col;
+    o.uv = i.uv;
+    o.attr = i.attr;
+    o.box = i.box;
+    return o;
+}
+
+uint enc(float4 c) {
+    uint3 v = (uint3)(c.rgb * 31.0 + 0.5);
+    return v.r | (v.g << 5) | (v.b << 10) | (c.a > 0.5 ? 0x8000u : 0u);
+}
+float4 at(int2 n, int2 sub) { return vram.Load(int3((n & int2(1023, 511)) * scale + sub, 0)); }
+
+static const int dither[16] = { -4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2 };
+
+// one texel through the texture window, page and palette; sub = position inside an upscaled texel
+float4 texel(int2 uvi, int2 sub, uint texpage, uint clut, uint win) {
+    int mx = win & 31, my = (win >> 5) & 31, ox = (win >> 10) & 31, oy = (win >> 15) & 31;
+    int u = ((uvi.x & ~(mx * 8)) | ((ox & mx) * 8)) & 255;
+    int v = ((uvi.y & ~(my * 8)) | ((oy & my) * 8)) & 255;
+    int tpx = (texpage & 15) * 64, tpy = ((texpage >> 4) & 1) * 256;
+    int depth = (texpage >> 7) & 3;
+    int2 cl = int2((clut & 63) * 16, (clut >> 6) & 511);
+    if (depth == 0) {
+        uint w = enc(at(int2(tpx + u / 4, tpy + v), int2(0, 0)));
+        return at(int2(cl.x + ((w >> ((u & 3) * 4)) & 15), cl.y), int2(0, 0));
+    }
+    if (depth == 1) {
+        uint w = enc(at(int2(tpx + u / 2, tpy + v), int2(0, 0)));
+        return at(int2(cl.x + ((w >> ((u & 1) * 8)) & 255), cl.y), int2(0, 0));
+    }
+    return at(int2(tpx + u, tpy + v), sub);
+}
+
+// a texel for the filters: kept inside the primitive's box, colour premultiplied by opacity (transparent = 0)
+float4 tx(int2 p, int4 box, uint texpage, uint clut, uint win) {
+    float4 s = texel(clamp(p, box.xy, box.zw), int2(0, 0), texpage, clut, win);
+    float op = enc(s) == 0 ? 0.0 : 1.0;
+    return float4(s.rgb * op, op);
+}
+// brightness for xBR's edge tests (48 = its weight for luma); transparency counts as a colour of its own
+float lum(float4 c) { return c.a > 0.5 ? dot(c.rgb, float3(0.299, 0.587, 0.114)) * 48.0 : 200.0; }
+float4 wdist(float4 a, float4 b, float4 c, float4 d, float4 e, float4 f, float4 g, float4 h) {
+    return abs(a - b) + abs(a - c) + abs(d - e) + abs(d - f) + 4.0 * abs(g - h);
+}
+bool4 near_eq(float4 a, float4 b) { return abs(a - b) < 15.0; }
+
+// xBR-lv2 by Hyllian (MIT licence: licenses/xBR-lv2.txt), free scale: the texel E under the sample and its
+// neighbours decide, per corner, whether an edge crosses E at 45 (or 30 / 60) degrees, and the part of E beyond
+// it takes the neighbour's colour. Pixel art keeps hard, smooth edges at any size instead of blocks (nearest) or
+// blur (bilinear). w = texels per pixel.
+//      A1 B1 C1
+//   A0 A  B  C  C4
+//   D0 D  E  F  F4
+//   G0 G  H  I  I4
+//      G5 H5 I5
+float4 xbr(float2 uv, float w, int4 box, uint texpage, uint clut, uint win) {
+    int2 e = (int2)floor(uv);
+    float2 fp = uv - e;
+#define T(dx, dy) tx(e + int2(dx, dy), box, texpage, clut, win)
+    float4 E = T(0, 0), B = T(0, -1), D = T(-1, 0), F = T(1, 0), H = T(0, 1);
+    float4 b = float4(lum(B), lum(D), lum(H), lum(F));
+    // every rule needs E to differ from a side neighbour: inside a flat patch E stays (5 texels read, not 21)
+    [branch] if (all(b == lum(E).xxxx)) return E;
+    float4 A1 = T(-1, -2), B1 = T(0, -2), C1 = T(1, -2);
+    float4 A0 = T(-2, -1), A = T(-1, -1), C = T(1, -1), C4 = T(2, -1);
+    float4 D0 = T(-2, 0), F4 = T(2, 0);
+    float4 G0 = T(-2, 1), G = T(-1, 1), I = T(1, 1), I4 = T(2, 1);
+    float4 G5 = T(-1, 2), H5 = T(0, 2), I5 = T(1, 2);
+#undef T
+    float4 c = float4(lum(C), lum(A), lum(G), lum(I));
+    float4 ee = lum(E).xxxx;
+    float4 d = b.yzwx, f = b.wxyz, g = c.zwxy, h = b.zwxy, ii = c.wxyz;
+    float4 i4 = float4(lum(I4), lum(C1), lum(A0), lum(G5));
+    float4 i5 = float4(lum(I5), lum(C4), lum(A1), lum(G0));
+    float4 h5 = float4(lum(H5), lum(F4), lum(B1), lum(D0));
+    float4 f4 = h5.yzwx;
+    // edge lines through E, per corner (bottom right, top right, top left, bottom left)
+    const float4 Ao = float4(1.0, -1.0, -1.0, 1.0), Bo = float4(1.0, 1.0, -1.0, -1.0), Co = float4(1.5, 0.5, -0.5, 0.5);
+    const float4 Bx = float4(0.5, 2.0, -0.5, -2.0), Cx = float4(1.0, 1.0, -0.5, 0.0);
+    const float4 By = float4(2.0, 0.5, -2.0, -0.5), Cy = float4(2.0, 0.0, -1.0, 0.5);
+    const float4 Ci = float4(0.25, 0.25, 0.25, 0.25);
+    float4 fx = Ao * fp.y + Bo * fp.x, fx_left = Ao * fp.y + Bx * fp.x, fx_up = Ao * fp.y + By * fp.x;
+    // anti-aliased edge: about one screen pixel wide, whatever the magnification
+    float dl = clamp(w, 0.02, 0.5);
+    float4 delta = dl.xxxx, deltaL = float4(0.5, 1.0, 0.5, 1.0) * dl, deltaU = deltaL.yxwz;
+    bool4 r0 = ee != f && ee != h;
+    bool4 r1 = r0 && (!near_eq(f, b) && !near_eq(h, d) || near_eq(ee, ii) && !near_eq(f, i4) && !near_eq(h, i5) || near_eq(ee, g) || near_eq(ee, c));
+    bool4 r2l = ee != g && d != g, r2u = ee != c && b != c;
+    float4 wd1 = wdist(ee, c, g, ii, h5, f4, h, f), wd2 = wdist(h, d, i5, f, i4, b, ee, ii);
+    bool4 edri = wd1 <= wd2 && r0, edr = wd1 < wd2 && r1;
+    bool4 edr_l = 2.0 * abs(f - g) <= abs(h - c) && r2l && edr, edr_u = abs(f - g) >= 2.0 * abs(h - c) && r2u && edr;
+    float4 fx45i = saturate((fx + delta - Co - Ci) / (2.0 * delta)) * edri;
+    float4 fx45 = saturate((fx + delta - Co) / (2.0 * delta)) * edr;
+    float4 fx30 = saturate((fx_left + deltaL - Cx) / (2.0 * deltaL)) * edr_l;
+    float4 fx60 = saturate((fx_up + deltaU - Cy) / (2.0 * deltaU)) * edr_u;
+    bool4 px = abs(ee - f) <= abs(ee - h);
+    float4 m = max(max(fx30, fx60), max(fx45, fx45i));
+    float4 r1c = lerp(E, px.x ? F : H, m.x);
+    r1c = lerp(r1c, px.z ? D : B, m.z);
+    float4 r2c = lerp(E, px.y ? B : F, m.y);
+    r2c = lerp(r2c, px.w ? H : D, m.w);
+    float3 d1 = abs(E.rgb - r1c.rgb) + abs(E.a - r1c.a), d2 = abs(E.rgb - r2c.rgb) + abs(E.a - r2c.a);
+    return dot(d1, 1) <= dot(d2, 1) ? r2c : r1c;
+}
+
+float4 ps_main(PSIn i) : SV_Target {
+    uint texpage = i.attr.x & 0xFFFF, clut = i.attr.x >> 16;
+    uint win = i.attr.y & 0xFFFFF, flags = i.attr.y >> 20;
+    float3 rgb = i.col.rgb;
+    float mask = (flags & 8) ? 1.0 : 0.0;
+    float2 duv = fwidth(i.uv); // texels per pixel (before any branch: derivatives need all four pixels)
+    if (flags & 16) {
+        // replaced button prompt: texpage = atlas slot, clut = sprite size in texels, uv relative to the sprite
+        float2 sz = float2(clut & 255, clut >> 8);
+        float2 a = (float2(texpage % 10, texpage / 10) + clamp(i.uv / sz, 0.002, 0.998)) / float2(10, 2); // ICON_COUNT x 2 rows
+        float4 t = icons.Sample(icon_smp, a);
+        if (t.a < 0.5 || pass_mode == 2) discard;
+        t.rgb /= t.a;
+        if (flags & 2) rgb = t.rgb;
+        else rgb = saturate(t.rgb * i.col.rgb * (255.0 / 128.0));
+    } else if (flags & 1) {
+        float4 t;
+        bool stp;
+        if (flags & 64) {
+            // HD letter (hd_text.cpp): box = its cell in the glyph atlas, uv relative to the sprite, win = the
+            // palette entries of its rim (low 4 bits) and of the letter; coverage blends the two, opacity cuts out
+            float2 cell = float2(i.box.x | (i.box.y << 8), i.box.z | (i.box.w << 8));
+            float2 g = glyphs.Sample(GLYPHS_SMP, (cell + (i.uv + HD_PAD) * HD_K) / HD_ATLAS);
+            if (g.y < 0.5) discard;
+            int2 cl = int2((clut & 63) * 16, (clut >> 6) & 511);
+            float4 rim = at(int2(cl.x + (win & 15), cl.y), int2(0, 0)), fill = at(int2(cl.x + ((win >> 4) & 15), cl.y), int2(0, 0));
+            t = lerp(rim, fill, g.x);
+            stp = (g.x < 0.5 ? rim.a : fill.a) > 0.5;
+        } else {
+            int2 uvi = (int2)floor(i.uv);
+            float2 fr = i.uv - uvi;
+            t = texel(uvi, (int2)min(fr * scale, scale - 1), texpage, clut, win);
+            uint tv = enc(t);
+            stp = (tv & 0x8000) != 0;
+            int4 box = (int4)i.box;
+            // filter 1 bilinear (small sprites such as letters stay sharp: flag 32), 2 xBR (for them too); 15-bit
+            // textures, which may be pictures the game rendered at the upscaled resolution, are never redrawn by xBR
+            int mode = filter == 1 && (flags & 32) ? 0 : filter == 2 && ((texpage >> 7) & 3) >= 2 ? 1 : filter;
+            if (mode == 2) {
+                float4 x = xbr(i.uv, max(duv.x, duv.y), box, texpage, clut, win);
+                if (x.a < 0.5) discard;
+                t.rgb = x.rgb / x.a;
+            } else if (mode == 1) {
+                // bilinear between the four nearest texels; transparent texels carry no weight
+                float2 uc = i.uv - 0.5;
+                int2 b = (int2)floor(uc);
+                float2 f = uc - b;
+                float4 acc = 0;
+                for (int k = 0; k < 4; k++) {
+                    int2 o = int2(k & 1, k >> 1);
+                    float wgt = (o.x ? f.x : 1 - f.x) * (o.y ? f.y : 1 - f.y);
+                    acc += tx(b + o, box, texpage, clut, win) * wgt;
+                }
+                if (acc.a < 0.5) discard;
+                t.rgb = acc.rgb / acc.a;
+            } else if (tv == 0) discard;
+        }
+        if (pass_mode == 1 && stp) discard;
+        if (pass_mode == 2 && !stp) discard;
+        if (flags & 2) rgb = t.rgb;
+        else rgb = saturate(t.rgb * i.col.rgb * (255.0 / 128.0));
+        if (stp) mask = 1.0;
+    }
+    if (!true_color) {
+        float3 c8 = rgb * 255.0;
+        if (flags & 4) {
+            int2 p = (int2)(i.pos.xy) / scale;
+            c8 = clamp(c8 + dither[(p.y & 3) * 4 + (p.x & 3)], 0, 255);
+        }
+        rgb = floor(c8 / 8.0) / 31.0;
+    }
+    return float4(rgb * src_factor, mask);
+}
+
+// full-rect helpers for uploads and fills
+float4 vs_rect(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2(id & 1, id >> 1);
+    float2 xy = lerp(rect.xy, rect.zw, p);
+    return float4(xy.x / (512.0 * scale) - 1.0, 1.0 - xy.y / (256.0 * scale), 0, 1);
+}
+SLOT(1) Texture2D<float4> native : register(t1);
+#ifdef __spirv__
+SLOT(1) SamplerState native_smp;
+#endif
+float4 ps_upload(float4 pos : SV_Position) : SV_Target { return native.Load(int3((int2)pos.xy / scale, 0)); }
+float4 ps_fill(float4 pos : SV_Position) : SV_Target { return fill_color; }
+float4 ps_down(float4 pos : SV_Position) : SV_Target { return vram.Load(int3((int2)pos.xy * scale, 0)); }
+
+// multisampled render target: a region copy into it (from the single-sample copy), the average of a pixel's
+// samples into the single-sample copy, and a per-sample copy out of it
+float4 ps_copy(float4 pos : SV_Position) : SV_Target { return native.Load(int3((int2)pos.xy + copy_off, 0)); }
+#ifndef __spirv__
+float4 ps_resolve(float4 pos : SV_Position) : SV_Target {
+    float4 s = 0;
+    for (int i = 0; i < samples; i++) s += vram_ms.Load((int2)pos.xy, i);
+    return s / samples;
+}
+float4 ps_copy_ms(float4 pos : SV_Position, uint si : SV_SampleIndex) : SV_Target { return vram_ms.Load((int2)pos.xy + copy_off, si); }
+#endif
+
+// a triangle over the whole target
+float4 vs_full(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0, 1);
+}
+
+// HD letter reconstruction (hd_text.cpp), drawn into the letter's atlas cell (rect.xy = its origin) when it is
+// first used. glyph_src, per texel on the letter's padded grid with two zero texels beyond each side: opacity and
+// coverage (brightness between the rim and the letter colour), interpolated (Catmull-Rom) to the pixel's centre,
+// texel j's centre being at (j + 0.5) * HD_K pixels. The letter ends at half coverage. The dark rim, never past
+// the original's opaque texels, runs out to where coverage fades (anti-aliased letters: an even rim) or, for
+// letters with a drawn outline rect.z texels wide, to that distance from the letter's edge: the most coverage
+// on rings around the pixel (16 directions, three radii up to rect.z) passes half, so the outline is the
+// letter's smooth shape grown by a disc. Their opacity is interpolated with the smoother B-spline, so where the
+// original outline is thinner, or around a see-through counter (0, 6, 8, 9), the cut is round too.
+SLOT(6) Texture2D<float2> glyph_src : register(t6);
+#ifdef __spirv__
+SLOT(6) SamplerState glyph_src_smp;
+#endif
+float4 cr_weights(float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return 0.5 * float4(-t + 2 * t2 - t3, 2 - 5 * t2 + 3 * t3, t + 4 * t2 - 3 * t3, t3 - t2);
+}
+float4 bspline_weights(float t) {
+    float u = 1 - t, t2 = t * t, t3 = t2 * t;
+    return float4(u * u * u, 3 * t3 - 6 * t2 + 4, -3 * t3 + 3 * t2 + 3 * t + 1, t3) / 6.0;
+}
+// both fields at s (texel units on the padded grid); reads beyond the texture return 0
+float2 glyph_fields(float2 s, bool smooth = false) {
+    int2 i = (int2)floor(s);
+    float4 wx = smooth ? bspline_weights(s.x - i.x) : cr_weights(s.x - i.x), wy = smooth ? bspline_weights(s.y - i.y) : cr_weights(s.y - i.y);
+    float2 f = 0;
+    [unroll] for (int y = 0; y < 4; y++) {
+        float2 r = 0;
+        [unroll] for (int x = 0; x < 4; x++) r += wx[x] * glyph_src.Load(int3(i + int2(x, y) + 1, 0));
+        f += wy[y] * r;
+    }
+    return f;
+}
+float4 ps_glyph(float4 pos : SV_Position) : SV_Target {
+    float2 s = (pos.xy - rect.xy) / HD_K - 0.5;
+    float2 f = glyph_fields(s);
+    float rim, opaque = f.x;
+    if (rect.z > 0.5) {
+        float grown = f.y;
+        [loop] for (int k = 0; k < 16; k++) {
+            float2 d;
+            sincos(k * 0.3926991, d.y, d.x);
+            [unroll] for (int ring = 1; ring <= 3; ring++) grown = max(grown, glyph_fields(s + d * (rect.z * ring / 3.0)).y);
+        }
+        rim = saturate((grown - 0.5) * HD_K + 0.5);
+        opaque = glyph_fields(s, true).x;
+    } else {
+        rim = saturate((f.y - 0.08) * HD_K * 2.5 + 0.5);
+    }
+    float a = min(rim, saturate((opaque - 0.15) * HD_K + 0.5));
+    return float4(a > 0 ? saturate((f.y - 0.5) * HD_K * 0.7 + 0.5) : 0, a, 0, 0);
+}
+
+// FXAA (after Timothy Lottes): find the edge direction from the luma of the four diagonal neighbours, blend
+// along it, and fall back to the shorter blend where the longer one leaves the local contrast range.
+// rect.xy = the picture's top left in the input, rect.zw = 1 / input size; fill_color = the picture's texel
+// centres (u0 v0 u1 v1), so nothing next to it in VRAM bleeds in.
+float3 pic(float2 uv) { return picture.SampleLevel(PICTURE_SMP, clamp(uv, fill_color.xy, fill_color.zw), 0).rgb; }
+float4 ps_fxaa(float4 pos : SV_Position) : SV_Target {
+    float2 rcp = rect.zw;
+    float2 uv = (rect.xy + pos.xy) * rcp;
+    const float3 L = float3(0.299, 0.587, 0.114);
+    float3 m = pic(uv);
+    float lnw = dot(pic(uv + float2(-1, -1) * rcp), L);
+    float lne = dot(pic(uv + float2(1, -1) * rcp), L);
+    float lsw = dot(pic(uv + float2(-1, 1) * rcp), L);
+    float lse = dot(pic(uv + float2(1, 1) * rcp), L);
+    float lm = dot(m, L);
+    float lmin = min(lm, min(min(lnw, lne), min(lsw, lse)));
+    float lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
+    float2 dir = float2(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));
+    float reduce = max((lnw + lne + lsw + lse) * (0.25 / 8.0), 1.0 / 128.0);
+    float rmin = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rmin, -8.0, 8.0) * rcp;
+    float3 a = 0.5 * (pic(uv + dir * (1.0 / 3.0 - 0.5)) + pic(uv + dir * (2.0 / 3.0 - 0.5)));
+    float3 b = a * 0.5 + 0.25 * (pic(uv - dir * 0.5) + pic(uv + dir * 0.5));
+    float lb = dot(b, L);
+    return float4(lb < lmin || lb > lmax ? a : b, 1);
+}

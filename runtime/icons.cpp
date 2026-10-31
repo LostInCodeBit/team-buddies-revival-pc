@@ -139,7 +139,7 @@ void icons_trace(const char* kind, s32 x, s32 y, s32 w, s32 h, int u0, int v0, i
         for (int i = 0; i < tw; i++) px[j * tw + i] = rgba_of(texel(gpu_vram(), st.texpage, st.clut, (u0 + i) & 255, (v0 + j) & 255));
     const char* dir = getenv("TB_SHOT_DIR");
     char name[96];
-    snprintf(name, sizeof name, "\\tex_%016llX_%dx%d.png", hv, tw, th);
+    snprintf(name, sizeof name, PATH_SEP "tex_%016llX_%dx%d.png", (unsigned long long)hv, tw, th);
     write_png(std::string(dir ? dir : g_base_dir.c_str()) + name, (const u8*)px.data(), tw, th, tw * 4);
     s_trace_n++;
 }

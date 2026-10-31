@@ -4,6 +4,8 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 *.rc text eol=crlf
+# shell scripts keep LF (sh stops at a CR), also in a Windows checkout built from WSL
+*.sh text eol=lf
 *.png binary
 *.ico binary
 *.dll binary

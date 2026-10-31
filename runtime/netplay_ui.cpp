@@ -71,6 +71,10 @@ void np_status_close() {
     s_status = s_status_text = nullptr;
 }
 
+void np_message(const char* text, bool warning) {
+    MessageBoxA(nullptr, text, "Team Buddies online", MB_OK | (warning ? MB_ICONWARNING : MB_ICONINFORMATION));
+}
+
 // ---------------------------------------------------------------- F9: Online dialog
 enum { ID_HOST = 101, ID_JOIN, ID_ADDR, ID_PORT, ID_START };
 static HWND s_dlg;

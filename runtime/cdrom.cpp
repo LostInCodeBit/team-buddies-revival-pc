@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <fstream>
 #include <mutex>
+#ifndef _WIN32
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#endif
 
 // ---------------------------------------------------------------- disc image
 struct TrackFile { FILE* f; u32 start_lba; u32 sectors; };

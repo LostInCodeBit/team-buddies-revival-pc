@@ -30,24 +30,30 @@ static InputDevice family_of(SDL_Gamepad* g) {
     }
 }
 
-static void handle_events() {
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
-            if (SDL_Gamepad* g = SDL_OpenGamepad(e.gdevice.which)) {
-                s_pads.push_back(g);
-                plog("gamepad: connected %s (player %zu)\n", SDL_GetGamepadName(g) ? SDL_GetGamepadName(g) : "?", s_pads.size());
-            }
-        } else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
-            for (size_t i = 0; i < s_pads.size(); i++)
-                if (SDL_GetGamepadID(s_pads[i]) == e.gdevice.which) {
-                    plog("gamepad: player %zu disconnected\n", i + 1);
-                    SDL_CloseGamepad(s_pads[i]);
-                    s_pads.erase(s_pads.begin() + i);
-                    break;
-                }
+// hot-plugging; the SDL3 platform layer passes these on from its own event loop (the queue has window events too)
+void gamepad_event(const SDL_Event& e) {
+    if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
+        if (SDL_Gamepad* g = SDL_OpenGamepad(e.gdevice.which)) {
+            s_pads.push_back(g);
+            plog("gamepad: connected %s (player %zu)\n", SDL_GetGamepadName(g) ? SDL_GetGamepadName(g) : "?", s_pads.size());
         }
+    } else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
+        for (size_t i = 0; i < s_pads.size(); i++)
+            if (SDL_GetGamepadID(s_pads[i]) == e.gdevice.which) {
+                plog("gamepad: player %zu disconnected\n", i + 1);
+                SDL_CloseGamepad(s_pads[i]);
+                s_pads.erase(s_pads.begin() + i);
+                break;
+            }
     }
+}
+
+bool g_gamepad_events_external; // set by the SDL3 platform layer
+
+static void handle_events() {
+    if (g_gamepad_events_external) return;
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) gamepad_event(e);
 }
 
 // Fills g_pads[first..] from the connected controllers; returns the family of a controller that was
