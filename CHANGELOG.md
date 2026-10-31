@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-31
+
+The Linux version is new and **experimental**: it has been tested under WSL (Mesa's llvmpipe) and, as the
+same code, on Windows' Vulkan driver, but not yet on Linux hardware; reports with `teambuddies.log` are
+welcome. The Windows version plays exactly as 0.1.0.
 
 ### Added
 - Linux version (x86-64, glibc 2.35+): an SDL3 platform layer (window, fullscreen, sound, keyboard,

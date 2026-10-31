@@ -6,7 +6,7 @@ Run `TeamBuddiesLauncher.exe` to change settings, choose the disc image and play
 runs. `TeamBuddies.exe` also runs on its own: it finds the `.cue` next to it (or in parent folders) or asks for
 it, then remembers the path in `teambuddies.ini`. Only the USA disc (SLUS-00869) is supported.
 
-On Linux there is no launcher: run `./TeamBuddies` (optionally with the `.cue` as argument); settings are in
+On Linux (experimental) there is no launcher: run `./TeamBuddies` (optionally with the `.cue` as argument); settings are in
 `teambuddies.ini` and on the hotkeys. Without Vulkan drivers the game falls back to the software renderer.
 
 Everything the game writes stays in its folder: `teambuddies.ini`, `teambuddies.log`, `savedata\`,

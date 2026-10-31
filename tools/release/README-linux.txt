@@ -4,6 +4,9 @@ Team Buddies - native PC port {VERSION} for Linux
 A native 64-bit Linux port of Team Buddies (PlayStation, 2000), USA release (SLUS-00869).
 Bring your own disc: this package contains no game data.
 
+EXPERIMENTAL: this Linux version has not been tested on Linux hardware yet. If something goes wrong,
+please report it with teambuddies.log.
+
 START
   1. Unpack this package into a folder you can write to:
        tar xzf TeamBuddies-{VERSION}-linux-x86_64.tar.gz

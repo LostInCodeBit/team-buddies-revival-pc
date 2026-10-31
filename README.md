@@ -28,7 +28,8 @@ native code. No emulator and no BIOS file. Bring your own disc.
 Needs Windows 10/11 64-bit and a Direct3D 11 graphics card. The programs aren't code-signed, so Windows may
 show "Windows protected your PC": choose **More info → Run anyway**.
 
-**Linux:** unpack `TeamBuddies-<version>-linux-x86_64.tar.gz` into a folder you can write to and run
+**Linux (experimental, not yet tested on Linux hardware):** unpack
+`TeamBuddies-<version>-linux-x86_64.tar.gz` into a folder you can write to and run
 `./TeamBuddies`; it asks for the `.cue` (or takes it as an argument). Needs x86-64 with glibc 2.35 or newer
 (Ubuntu 22.04, Debian 12, Fedora 36 or later), X11 or Wayland, and Vulkan drivers for the hardware renderer
 (without them the game uses its software renderer). There is no launcher: settings are in `teambuddies.ini`
