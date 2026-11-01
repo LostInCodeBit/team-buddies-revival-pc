@@ -30,6 +30,7 @@ SPIRV = [
     ("ps_glyph", "gpu.hlsl", "ps_glyph", "ps", []),
     ("vs_present", "present.hlsl", "vs_main", "vs", ["VERTEX"]),
     ("ps_present", "present.hlsl", "ps_main", "ps", []),
+    ("ps_overlay", "present.hlsl", "ps_overlay", "ps", []),
 ]
 PIECE = 15000  # MSVC takes at most ~16 KB per string literal; the pieces are joined by the compiler
 

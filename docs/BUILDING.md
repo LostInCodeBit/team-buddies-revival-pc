@@ -77,3 +77,18 @@ debug files and anything from the disc never end up in it. Upload both to a GitH
 On Linux, `tools/package_linux.sh 0.2.0 <source url>` does the same from `build-linux/` (or `OUT`):
 `dist/TeamBuddies-0.2.0-linux-x86_64.tar.gz` (game, `libSDL3.so.0`, `README.txt`, docs, licences), and its
 line in `dist/SHA256SUMS.txt` next to the Windows zip's.
+
+### Signed updates
+
+The Windows launcher installs a newer release by itself (`launcher/update.cpp`) only when the release's
+`SHA256SUMS.txt` is signed with the maintainer's key: `SHA256SUMS.txt.sig`, base64 of an ECDSA P-256
+signature, checked against the public key compiled into the launcher (`launcher/release_key.inc`). The zip's
+SHA-256 must be the signed one, the zip may hold only the release's files and its `CHANGELOG.md` must name the
+version of the tag; files are swapped by renaming, with every file put back if a step fails.
+
+- `tools\release_key.ps1` makes the key once (`%USERPROFILE%\.team-buddies\release-signing.key`, or
+  `TB_RELEASE_KEY`; readable by that Windows user only) and writes `launcher\release_key.inc`. Keep an offline
+  backup of the key file: without it, launchers cannot install later releases by themselves.
+- `tools\sign_release.ps1` writes `dist\SHA256SUMS.txt.sig` and checks it against `release_key.inc`.
+  `package_release.ps1` runs it at its end; `package_linux.sh` deletes a signature it makes stale, so run
+  `sign_release.ps1` after the last package script. Upload the `.sig` with the other assets.

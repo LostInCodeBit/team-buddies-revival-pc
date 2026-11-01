@@ -2,6 +2,8 @@
 #include "files.h"
 #include "settings.h"
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <map>
@@ -33,7 +35,7 @@ void settings_load(const std::string& path) {
     auto B = [&](const char* k, bool& v) { if (kv.count(k)) v = kv[k] == "1" || kv[k] == "true" || kv[k] == "yes"; };
     if (kv.count("disc")) s.disc = kv["disc"];
     if (kv.count("renderer")) s.renderer = kv["renderer"] == "software" ? 0 : 1;
-    I("resolution_scale", s.scale);
+    if (kv.count("resolution_scale")) s.scale = kv["resolution_scale"] == "screen" ? SCALE_SCREEN : std::clamp(atoi(kv["resolution_scale"].c_str()), 1, 8);
     I("window_width", s.window_w);
     I("window_height", s.window_h);
     if (kv.count("display")) {
@@ -44,7 +46,14 @@ void settings_load(const std::string& path) {
         B("fullscreen", fs);
         s.display = fs ? DISPLAY_BORDERLESS : DISPLAY_WINDOW;
     }
+    if (kv.count("fullscreen_resolution")) { // "desktop" or WIDTHxHEIGHT
+        int w = 0, h = 0;
+        bool ok = sscanf(kv["fullscreen_resolution"].c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240 && w <= 16384 && h <= 16384;
+        s.fullscreen_w = ok ? w : 0;
+        s.fullscreen_h = ok ? h : 0;
+    }
     B("vsync", s.vsync);
+    B("show_fps", s.show_fps);
     if (kv.count("frame_rate")) {
         const std::string& v = kv["frame_rate"];
         int n = atoi(v.c_str());
@@ -67,6 +76,8 @@ void settings_load(const std::string& path) {
     B("multitap", s.multitap);
     B("vibration", s.vibration);
     B("skip_intro", s.skip_intro);
+    B("check_updates", s.check_updates);
+    B("discord_presence", s.discord);
     if (kv.count("button_icons")) {
         const std::string& v = kv["button_icons"];
         s.button_icons = v == "playstation" ? 1 : v == "xbox" ? 2 : v == "keyboard" ? 3 : 0;
@@ -74,10 +85,9 @@ void settings_load(const std::string& path) {
     if (kv.count("online_address")) s.online_address = kv["online_address"];
     I("online_port", s.online_port);
     I("log_level", s.log_level);
-    s.scale = std::clamp(s.scale, 1, 8);
     s.window_w = std::clamp(s.window_w, 320, 16384);
     s.window_h = std::clamp(s.window_h, 240, 16384);
-    s.volume = std::clamp(s.volume, 0, 100);
+    s.volume = std::clamp(s.volume, 0, 200);
     if (!(s.cpu_cpi >= 0.25 && s.cpu_cpi <= 8.0)) s.cpu_cpi = 2.0;
     if (s.online_port < 1 || s.online_port > 65535) s.online_port = 7845;
 }
@@ -93,12 +103,18 @@ bool settings_save(const std::string& path) {
         f << "disc = " << s.disc << "\n\n";
         f << "; renderer: hardware (upscaled: Direct3D 11 on Windows, Vulkan on Linux) or software (original 1x)\n";
         f << "renderer = " << (s.renderer ? "hardware" : "software") << "\n";
-        f << "; internal resolution multiplier for the hardware renderer (1-8), F2/F3 in game\n";
-        f << "resolution_scale = " << s.scale << "\n";
+        f << "; internal resolution multiplier for the hardware renderer (1-8), or screen: the smallest that fills the\n";
+        f << "; picture on your screen (or in the window, as it resizes); F2/F3 in game\n";
+        f << "resolution_scale = " << (s.scale == SCALE_SCREEN ? std::string("screen") : std::to_string(s.scale)) << "\n";
         f << "; display: window, borderless or fullscreen (exclusive); F11 switches window <-> full screen\n";
         f << "display = " << (s.display == DISPLAY_BORDERLESS ? "borderless" : s.display == DISPLAY_FULLSCREEN ? "fullscreen" : "window") << "\n";
         f << "window_width = " << s.window_w << "\nwindow_height = " << s.window_h << "\n";
+        f << "; fullscreen_resolution: desktop (the screen's own) or WIDTHxHEIGHT, e.g. 1920x1080: the screen's mode while\n";
+        f << "; display = fullscreen (borderless always uses the desktop's)\n";
+        f << "fullscreen_resolution = " << (s.fullscreen_w > 0 ? std::to_string(s.fullscreen_w) + "x" + std::to_string(s.fullscreen_h) : std::string("desktop")) << "\n";
         f << "vsync = " << b(s.vsync) << "\n";
+        f << "; FPS counter in the top-left corner: frames shown per second and the game's own (Shift+F10)\n";
+        f << "show_fps = " << b(s.show_fps) << "\n";
         f << "; frame_rate: original (gameplay runs at 30), 60, 120, 144, 165, 240... or monitor: in-between frames are\n";
         f << "; drawn up to that rate, the game keeps its speed (hardware renderer; F10 switches it off and on)\n";
         f << "frame_rate = " << (s.frame_rate == FRAME_RATE_MONITOR ? "monitor" : s.frame_rate >= 60 ? std::to_string(s.frame_rate) : "original") << "\n";
@@ -119,6 +135,7 @@ bool settings_save(const std::string& path) {
         f << "true_color = " << b(s.true_color) << "\n";
         f << "; emulated CPU speed: 2.0 = original, lower = faster CPU (less slowdown)\n";
         f << "cpu_cycles_per_instruction = " << s.cpu_cpi << "\n";
+        f << "; volume in percent, 0-200: above 100 is louder than the original\n";
         f << "volume = " << s.volume << "\n";
         f << "; emulate a multitap on port 1 for 4 players\n";
         f << "multitap = " << b(s.multitap) << "\n";
@@ -126,6 +143,10 @@ bool settings_save(const std::string& path) {
         f << "vibration = " << b(s.vibration) << "\n";
         f << "; skip the logos and intro movies at start\n";
         f << "skip_intro = " << b(s.skip_intro) << "\n";
+        f << "; the launcher looks for a newer release on GitHub when it opens (Windows)\n";
+        f << "check_updates = " << b(s.check_updates) << "\n";
+        f << "; Discord Rich Presence: what you're playing shows on your Discord profile (needs the Discord app)\n";
+        f << "discord_presence = " << b(s.discord) << "\n";
         f << "; button prompts: auto (follow the device in use), playstation, xbox or keyboard\n";
         f << "button_icons = " << (s.button_icons == 1 ? "playstation" : s.button_icons == 2 ? "xbox" : s.button_icons == 3 ? "keyboard" : "auto") << "\n";
         f << "; online play (F9): last address joined and the UDP port\n";
@@ -136,4 +157,33 @@ bool settings_save(const std::string& path) {
         if (!f) { f.close(); file_delete(tmp); return false; }
     }
     return file_move(tmp, path, MOVE_DURABLE);
+}
+
+// ---------------------------------------------------------------- the picture inside the window
+void fit_picture(const Settings& s, int ww, int wh, int native_h, bool online, double& vw, double& vh) {
+    vw = ww;
+    vh = wh;
+    const double base = s.widescreen ? 16.0 / 9.0 : 4.0 / 3.0;
+    double a = base;
+    switch (s.aspect) {
+    case ASPECT_STRETCH: return;
+    case ASPECT_WIDE: if (!online) return; a = 16.0 / 9.0; break; // online the 3D view is fixed at 16:9
+    case ASPECT_16_9: a = 16.0 / 9.0; break;
+    case ASPECT_PIXELS: {
+        // whole-number multiples of the game's own lines: every source pixel the same size
+        double bh = native_h > 0 ? native_h : 240, bw = bh * base;
+        int k = (int)std::min(ww / bw, wh / bh);
+        if (k >= 1) { vw = bw * k; vh = bh * k; return; }
+        break;
+    }
+    }
+    if (vw / vh > a) vw = vh * a;
+    else vh = vw / a;
+}
+
+int screen_scale(const Settings& s, int ww, int wh, bool online) {
+    double vw, vh;
+    fit_picture(s, ww, wh, 240, online, vw, vh);
+    // a little slack: a picture exactly 960 lines tall stays at 4x
+    return std::clamp((int)std::ceil(std::max(vw / 320, vh / 240) - 0.01), 1, 8);
 }

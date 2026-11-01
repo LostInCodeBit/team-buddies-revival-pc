@@ -151,24 +151,7 @@ void shot_save(const u8* rgba, int w, int h, int pitch) {
 // ---------------------------------------------------------------- the picture inside the window
 // size of the picture inside a ww x wh window for the aspect setting; native_h = the game's own line count
 void picture_size(int ww, int wh, int native_h, double& vw, double& vh) {
-    vw = ww;
-    vh = wh;
-    const double base = g_settings.widescreen ? 16.0 / 9.0 : 4.0 / 3.0;
-    double a = base;
-    switch (g_settings.aspect) {
-    case ASPECT_STRETCH: return;
-    case ASPECT_WIDE: if (!netplay_active()) return; a = 16.0 / 9.0; break; // online the 3D view is fixed at 16:9
-    case ASPECT_16_9: a = 16.0 / 9.0; break;
-    case ASPECT_PIXELS: {
-        // whole-number multiples of the game's own lines: every source pixel the same size
-        double bh = native_h > 0 ? native_h : 240, bw = bh * base;
-        int k = (int)std::min(ww / bw, wh / bh);
-        if (k >= 1) { vw = bw * k; vh = bh * k; return; }
-        break;
-    }
-    }
-    if (vw / vh > a) vw = vh * a;
-    else vh = vw / a;
+    fit_picture(g_settings, ww, wh, native_h, netplay_active(), vw, vh);
 }
 
 // widescreen hack strength: 3/4 for 16:9; "wide" follows the window's shape (offline only, it changes the 3D maths)
@@ -177,6 +160,27 @@ void update_widescreen_factor(int ww, int wh) {
     if (g_settings.aspect == ASPECT_WIDE && !netplay_active() && wh > 0)
         q = std::clamp((int)(65536.0 * (4.0 / 3.0) / ((double)ww / wh)), 16384, 65536);
     g_gpu_widescreen_q16 = q;
+}
+
+// resolution_scale = screen: the multiple for the picture in the window, as of the last frame drawn
+static int s_screen_scale;
+
+void update_screen_scale(int ww, int wh) {
+    if (g_settings.scale != SCALE_SCREEN || ww <= 0 || wh <= 0) return;
+    int k = screen_scale(g_settings, ww, wh, netplay_active());
+    if (k != s_screen_scale) plog("internal resolution x%d, filling %dx%d\n", k, ww, wh);
+    s_screen_scale = k;
+}
+
+int render_scale() {
+    if (g_settings.scale != SCALE_SCREEN) return g_settings.scale;
+    if (!s_screen_scale) { // before the first frame: the window as it is now (the default while it has no size)
+        int ww, wh;
+        platform_get_window_size(ww, wh);
+        update_screen_scale(ww, wh);
+        if (!s_screen_scale) s_screen_scale = Settings().scale;
+    }
+    return s_screen_scale;
 }
 
 // ---------------------------------------------------------------- pacing
@@ -362,21 +366,24 @@ void poll_input() {
     frame++;
     static int quit_at = getenv("TB_FRAMES") ? atoi(getenv("TB_FRAMES")) : 0;
     if (quit_at > 0 && frame >= quit_at) s_quit = true;
-    // TB_KEYS="6400=F1;6500=F3": function keys pressed at those frames (test harness)
-    static std::vector<std::pair<int, int>> keys;
+    // TB_KEYS="6400=F1;6500=Shift+F10": function keys pressed at those frames (test harness)
+    struct Key { int frame, f; bool shift; };
+    static std::vector<Key> keys;
     static bool keys_parsed = false;
     if (!keys_parsed) {
         keys_parsed = true;
         if (const char* e = getenv("TB_KEYS"))
             for (const char* p = e; *p;) {
                 int f = 0, n = 0;
-                if (sscanf(p, "%d=F%d", &f, &n) == 2 && n >= 1 && n <= 12) keys.push_back({f, n});
+                bool shift = false, ok = sscanf(p, "%d=F%d", &f, &n) == 2;
+                if (!ok) ok = shift = sscanf(p, "%d=Shift+F%d", &f, &n) == 2;
+                if (ok && n >= 1 && n <= 12) keys.push_back({f, n, shift});
                 p = strchr(p, ';');
                 if (!p) break;
                 p++;
             }
     }
-    for (auto& k : keys) if (k.first == frame) hotkey(k.second);
+    for (auto& k : keys) if (k.frame == frame) hotkey(k.f, k.shift);
     for (int pad = 0; pad < 2; pad++) {
         if (script[pad].empty()) continue;
         u16 sb = 0;
@@ -401,15 +408,23 @@ void poll_input() {
         }
     }
     netplay_sync(); // online: replaces the pads with both players' input for this frame
+    discord_tick();
 }
 
-void hotkey(int f) {
+void hotkey(int f, bool shift) {
+    if (shift && f == 10) { // Shift+F10: the FPS counter (F10 is the frame rate)
+        g_settings.show_fps = !g_settings.show_fps;
+        plog("fps counter %s\n", g_settings.show_fps ? "on" : "off");
+        return;
+    }
     switch (f) {
     case 11: platform_toggle_fullscreen(); break;
     case 12: s_shot_request = true; break;
     case 9: netplay_dialog(); break;
-    case 2: if (g_settings.scale > 1) g_settings.scale--; plog("internal resolution x%d\n", g_settings.scale); break;
-    case 3: if (g_settings.scale < 8) g_settings.scale++; plog("internal resolution x%d\n", g_settings.scale); break;
+    case 2: case 3: // a fixed multiple from here on (from "screen": one either side of what it picked)
+        g_settings.scale = std::clamp(render_scale() + (f == 3 ? 1 : -1), 1, 8);
+        plog("internal resolution x%d\n", g_settings.scale);
+        break;
     case 4: if (netplay_active()) break; // changes the 3D maths: both players must match
         g_settings.widescreen = !g_settings.widescreen; g_gpu_widescreen_hack = g_settings.widescreen; break;
     case 5: g_settings.bilinear = !g_settings.bilinear; break;

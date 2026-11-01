@@ -145,7 +145,7 @@ struct D3DRenderer : HwRenderer {
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         dev->CreateTexture2D(&td, nullptr, &down_stage);
 
-        create_targets(g_settings.scale, aa_samples(g_settings.anti_aliasing));
+        create_targets(render_scale(), aa_samples(g_settings.anti_aliasing));
         upload_rect(0, 0, 1024, 512);
     }
 

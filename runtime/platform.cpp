@@ -10,6 +10,7 @@
 #include <timeapi.h>
 #include "platform_common.h"
 #include <cmath>
+#include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -92,12 +93,12 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SYSKEYDOWN:
         if (w == VK_RETURN && (l & (1 << 29))) { platform_toggle_fullscreen(); return 0; }
         if (w == VK_F10) { // F10 arrives as a system key (it would open the window menu)
-            if (!(l & (1 << 30))) hotkey(10);
+            if (!(l & (1 << 30))) hotkey(10, GetKeyState(VK_SHIFT) < 0);
             return 0;
         }
         break;
     case WM_KEYDOWN:
-        if (!(l & (1 << 30)) && w >= VK_F1 && w <= VK_F12) hotkey((int)(w - VK_F1) + 1);
+        if (!(l & (1 << 30)) && w >= VK_F1 && w <= VK_F12) hotkey((int)(w - VK_F1) + 1, GetKeyState(VK_SHIFT) < 0);
         return 0;
     }
     return DefWindowProc(h, m, w, l);
@@ -115,6 +116,12 @@ static ID3D11Buffer* s_cb;
 static ID3D11Texture2D* s_sw_tex;
 static ID3D11ShaderResourceView* s_sw_srv;
 static int s_sw_w, s_sw_h;
+static ID3D11PixelShader* s_ps_overlay;   // the FPS counter's chip
+static ID3D11BlendState* s_blend_premul;
+static ID3D11Texture2D* s_ov_tex;
+static ID3D11ShaderResourceView* s_ov_srv;
+static int s_ov_w, s_ov_h;
+static unsigned s_ov_version;
 
 ID3D11Device* d3d_device() { return s_dev; }
 ID3D11DeviceContext* d3d_context() { return s_ctx; }
@@ -146,12 +153,46 @@ static void resize_swapchain() {
     create_rtv();
 }
 
-// exclusive fullscreen at the desktop's own mode; falls back to borderless if DXGI refuses
+// fullscreen_resolution: that mode of the window's monitor, at the desktop's refresh rate when the monitor
+// has it at that size, else the highest; false = no choice made or no such mode (the desktop's mode stays)
+static bool chosen_mode(DXGI_MODE_DESC& out) {
+    const int w = g_settings.fullscreen_w, h = g_settings.fullscreen_h;
+    if (w <= 0 || h <= 0) return false;
+    IDXGIOutput* o = nullptr;
+    if (FAILED(s_swap->GetContainingOutput(&o))) return false;
+    std::vector<DXGI_MODE_DESC> modes;
+    UINT n = 0;
+    if (SUCCEEDED(o->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &n, nullptr)) && n) {
+        modes.resize(n);
+        if (FAILED(o->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &n, modes.data()))) n = 0;
+        modes.resize(n);
+    }
+    o->Release();
+    const long desk = platform_refresh_hz();
+    double best = -1;
+    for (const DXGI_MODE_DESC& m : modes) {
+        if ((int)m.Width != w || (int)m.Height != h || !m.RefreshRate.Denominator) continue;
+        double hz = (double)m.RefreshRate.Numerator / m.RefreshRate.Denominator;
+        double score = std::lround(hz) == desk ? 1e6 + hz : hz;
+        if (score > best) { best = score; out = m; }
+    }
+    if (best < 0) plog("display: the monitor has no %dx%d mode, fullscreen keeps the desktop's\n", w, h);
+    return best >= 0;
+}
+
+// exclusive fullscreen at the desktop's own mode or fullscreen_resolution; falls back to borderless if DXGI refuses
 static void set_exclusive(bool on) {
     if (!s_swap) return;
     HRESULT hr = s_swap->SetFullscreenState(on ? TRUE : FALSE, nullptr);
     if (FAILED(hr) && on) { plog("display: exclusive fullscreen refused (%08lX), staying borderless\n", (unsigned long)hr); on = false; }
     s_exclusive = on;
+    DXGI_MODE_DESC m;
+    if (on && chosen_mode(m)) {
+        // in exclusive mode ResizeTarget switches the screen to that mode; WM_SIZE then resizes the buffers
+        hr = s_swap->ResizeTarget(&m);
+        if (FAILED(hr)) plog("display: %ux%u refused (%08lX), fullscreen keeps the desktop's mode\n", m.Width, m.Height, (unsigned long)hr);
+        else plog("display: fullscreen %ux%u at %.2f Hz\n", m.Width, m.Height, (double)m.RefreshRate.Numerator / m.RefreshRate.Denominator);
+    }
     resize_swapchain();
 }
 
@@ -198,10 +239,20 @@ static bool d3d_init() {
     create_rtv();
     ID3DBlob* vs = d3d_compile(k_present_hlsl, "vs_main", "vs_5_0");
     ID3DBlob* ps = d3d_compile(k_present_hlsl, "ps_main", "ps_5_0");
+    ID3DBlob* po = d3d_compile(k_present_hlsl, "ps_overlay", "ps_5_0");
     s_dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &s_vs);
     s_dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &s_ps);
+    s_dev->CreatePixelShader(po->GetBufferPointer(), po->GetBufferSize(), nullptr, &s_ps_overlay);
     vs->Release();
     ps->Release();
+    po->Release();
+    D3D11_BLEND_DESC bl = {};
+    bl.RenderTarget[0].BlendEnable = TRUE;
+    bl.RenderTarget[0].SrcBlend = bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bl.RenderTarget[0].DestBlend = bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bl.RenderTarget[0].BlendOp = bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    s_dev->CreateBlendState(&bl, &s_blend_premul);
     D3D11_SAMPLER_DESC smp = {};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -239,6 +290,55 @@ static void capture_backbuffer() {
     bb->Release();
 }
 
+// the FPS counter over the window's top-left corner (show_fps)
+static void draw_fps_counter(int wh) {
+    const FpsOverlay* o = fps_overlay(wh);
+    if (!o || !s_ps_overlay || !s_blend_premul) return;
+    if (!s_ov_tex || s_ov_w != o->w || s_ov_h != o->h) {
+        if (s_ov_srv) s_ov_srv->Release();
+        if (s_ov_tex) s_ov_tex->Release();
+        s_ov_srv = nullptr;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = o->w;
+        td.Height = o->h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init = {o->rgba, (UINT)o->w * 4, 0};
+        if (FAILED(s_dev->CreateTexture2D(&td, &init, &s_ov_tex))) { s_ov_tex = nullptr; return; }
+        s_dev->CreateShaderResourceView(s_ov_tex, nullptr, &s_ov_srv);
+        s_ov_w = o->w;
+        s_ov_h = o->h;
+        s_ov_version = o->version;
+    }
+    if (!s_ov_srv) return;
+    if (s_ov_version != o->version) {
+        s_ctx->UpdateSubresource(s_ov_tex, 0, nullptr, o->rgba, o->w * 4, 0);
+        s_ov_version = o->version;
+    }
+    D3D11_VIEWPORT vp = {(float)o->x, (float)o->y, (float)o->w, (float)o->h, 0, 1};
+    s_ctx->RSSetViewports(1, &vp);
+    float rect[4] = {0, 0, 1, 1};
+    s_ctx->UpdateSubresource(s_cb, 0, nullptr, rect, 0, 0);
+    s_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    s_ctx->IASetInputLayout(nullptr);
+    s_ctx->VSSetShader(s_vs, nullptr, 0);
+    s_ctx->VSSetConstantBuffers(0, 1, &s_cb);
+    s_ctx->PSSetShader(s_ps_overlay, nullptr, 0);
+    s_ctx->PSSetShaderResources(0, 1, &s_ov_srv);
+    s_ctx->PSSetSamplers(0, 1, &s_point);
+    s_ctx->OMSetBlendState(s_blend_premul, nullptr, 0xFFFFFFFF);
+    s_ctx->OMSetDepthStencilState(nullptr, 0);
+    s_ctx->RSSetState(nullptr);
+    s_ctx->Draw(4, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    s_ctx->PSSetShaderResources(0, 1, &none);
+    s_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+}
+
 void d3d_present_texture(ID3D11ShaderResourceView* srv, float u0, float v0, float u1, float v1, int src_w, int src_h, int native_h, bool enabled) {
     g_sync_interval = 1;
     d3d_show(srv, u0, v0, u1, v1, src_w, src_h, native_h, enabled);
@@ -256,6 +356,7 @@ bool d3d_show(ID3D11ShaderResourceView* srv, float u0, float v0, float u1, float
     platform_get_window_size(ww, wh);
     if (ww <= 0 || wh <= 0) return false; // minimized: nothing to draw
     update_widescreen_factor(ww, wh);
+    update_screen_scale(ww, wh);
     float black[4] = {0, 0, 0, 1};
     s_ctx->OMSetRenderTargets(1, &s_rtv, nullptr);
     s_ctx->ClearRenderTargetView(s_rtv, black);
@@ -281,6 +382,7 @@ bool d3d_show(ID3D11ShaderResourceView* srv, float u0, float v0, float u1, float
         ID3D11ShaderResourceView* none = nullptr;
         s_ctx->PSSetShaderResources(0, 1, &none);
     }
+    draw_fps_counter(wh);
     if (shot_due()) capture_backbuffer();
     LARGE_INTEGER p0, p1;
     QueryPerformanceCounter(&p0);
@@ -290,6 +392,7 @@ bool d3d_show(ID3D11ShaderResourceView* srv, float u0, float v0, float u1, float
     if (pr == DXGI_ERROR_DEVICE_REMOVED || pr == DXGI_ERROR_DEVICE_RESET) // driver crash/update: tell the user instead of freezing
         fatal("The graphics device was lost (driver reset or GPU removed, reason %08lX).\nPlease restart the game.",
               (unsigned long)s_dev->GetDeviceRemovedReason());
+    fps_frame_presented();
     return true;
 }
 

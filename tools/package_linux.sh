@@ -45,5 +45,8 @@ hash=$(sha256sum "$DIST/$NAME.tar.gz" | cut -d' ' -f1)
 { if [ -f "$DIST/SHA256SUMS.txt" ]; then grep -v "  $NAME.tar.gz\$" "$DIST/SHA256SUMS.txt" || true; fi
   echo "$hash  $NAME.tar.gz"; } > "$DIST/SHA256SUMS.txt.tmp"
 mv "$DIST/SHA256SUMS.txt.tmp" "$DIST/SHA256SUMS.txt"
+# a signature of the old SHA256SUMS.txt would make the Windows launcher refuse the release: sign it again
+rm -f "$DIST/SHA256SUMS.txt.sig"
 echo "$DIST/$NAME.tar.gz  $(du -h "$DIST/$NAME.tar.gz" | cut -f1)"
 echo "$DIST/SHA256SUMS.txt  $hash"
+echo "SHA256SUMS.txt changed: sign it on Windows (tools\\sign_release.ps1) before uploading"

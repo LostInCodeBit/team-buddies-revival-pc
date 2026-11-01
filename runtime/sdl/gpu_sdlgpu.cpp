@@ -104,7 +104,7 @@ struct SdlGpuRenderer : HwRenderer {
         if (!pipe(P_MAIN, 0, RGBA8, 1) || !pipe(P_UPLOAD, 0, RGBA8, 1) || !pipe(P_FILL, 0, RGBA8, 1) || !pipe(P_DOWN, 0, RGBA8, 1)) return;
         create_icon_atlas();
         create_glyph_atlas();
-        create_targets(g_settings.scale, aa_samples(g_settings.anti_aliasing));
+        create_targets(render_scale(), aa_samples(g_settings.anti_aliasing));
         upload_rect(0, 0, 1024, 512);
         ok = true;
     }

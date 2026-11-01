@@ -31,9 +31,9 @@ struct Prim {
     float cx, cy;         // centre, relative to the frame's display origin
     float bw, bh;         // bounding box size
     int match;            // the same primitive in the previous frame, -1 = none
-    bool inherit;         // unmatched, but moves with a neighbour of the same object by (ix, iy)
+    bool inherit;         // unmatched, but moves with its neighbours in the same object: corner k by (ivx, ivy)[k]
     u8 how;               // how it was matched: 0 not, 1 anchor, 2 build order, 3 nearest, 4 moves with a neighbour
-    float ix, iy;
+    float ivx[4], ivy[4];
     float dx[4], dy[4];   // per vertex: where it was in the previous frame, relative (in-between frames move it back
                           // by that times 1 - t)
     bool on_screen;       // draws into the displayed buffer
@@ -155,7 +155,7 @@ void displacements(const Frame& A, Frame& B) {
         const int n = b.kind == K_POLY || b.kind == K_LINE ? b.n : 1;
         for (int k = 0; k < n; k++) {
             if (a) { b.dx[k] = a->v[k].x + sx - b.v[k].x; b.dy[k] = a->v[k].y + sy - b.v[k].y; }
-            else if (b.inherit) { b.dx[k] = -b.ix; b.dy[k] = -b.iy; }
+            else if (b.inherit) { b.dx[k] = -b.ivx[k]; b.dy[k] = -b.ivy[k]; }
             else b.dx[k] = b.dy[k] = 0;
         }
     }
@@ -240,14 +240,15 @@ void match() {
         }
     // equal size, believable move, close to how its part of the screen moved, and (when the key alone cannot
     // tell, as with untextured faces) the same shape and shading: a blend of two different faces is a sliver,
-    // while an unmatched face still moves with its object (pass 4) and stays whole
-    auto plausible = [&](const Prim& a, const Prim& b) {
+    // while an unmatched face still moves with its object (pass 4) and stays whole. Returns how well the shapes
+    // agree (1 = exactly, towards 0 at the limit), or -1 if a cannot be b.
+    auto fit = [&](const Prim& a, const Prim& b) {
         float dx = b.cx - a.cx, dy = b.cy - a.cy;
-        if (std::fabs(dx) > MAX_MOVE || std::fabs(dy) > MAX_MOVE || !similar(a, b)) return false;
+        if (std::fabs(dx) > MAX_MOVE || std::fabs(dy) > MAX_MOVE || !similar(a, b)) return -1.0f;
         int c = cell(b.cx, b.cy);
         float tol = std::max(16.0f, std::max(b.bw, b.bh));
-        if (std::fabs(dx - mx[c]) > tol || std::fabs(dy - my[c]) > tol) return false;
-        if (b.kind != K_POLY && b.kind != K_LINE) return true;
+        if (std::fabs(dx - mx[c]) > tol || std::fabs(dy - my[c]) > tol) return -1.0f;
+        if (b.kind != K_POLY && b.kind != K_LINE) return 1.0f;
         float ax = 0, ay = 0, bx = 0, by = 0;
         for (int k = 0; k < b.n; k++) { ax += a.v[k].x; ay += a.v[k].y; bx += b.v[k].x; by += b.v[k].y; }
         ax /= b.n; ay /= b.n; bx /= b.n; by /= b.n;
@@ -259,9 +260,12 @@ void match() {
         }
         shape /= b.n;
         shade /= 3.0f * b.n;
-        if (shape > 4 + 0.04f * (b.bw * b.bw + b.bh * b.bh)) return false;
-        return (b.flags & PF_TEXTURED) || shade <= 40;
+        const float shape_tol = 4 + 0.04f * (b.bw * b.bw + b.bh * b.bh);
+        if (shape > shape_tol) return -1.0f;
+        if (!(b.flags & PF_TEXTURED) && shade > 40) return -1.0f;
+        return 1 - shape / shape_tol;
     };
+    auto plausible = [&](const Prim& a, const Prim& b) { return fit(a, b) >= 0; };
     // how far its vertices are from where the local motion puts them (picks the right one of equal faces)
     auto cost = [&](const Prim& a, const Prim& b) {
         int c = cell(b.cx, b.cy), n = b.kind == K_RECT ? 1 : b.n;
@@ -290,29 +294,91 @@ void match() {
     for (int k = tails_k.empty() ? -1 : tails_k.back(); k >= 0; k = prev_k[k]) chain.push_back(anchors[k]);
     chain.push_back({-1, -1});
     std::reverse(chain.begin(), chain.end());
-    // within a window ahead in build order, the equal primitive whose vertices fit best
-    const int WINDOW = 48;
+    // Between two anchors both frames list the same parts in the same order, apart from faces that turned away
+    // or came into view, so the two runs are aligned like sequences: the order-keeping set of pairs of equal,
+    // plausible primitives worth the most. What a pair is worth: 1, less how far it strays from the local
+    // motion (nothing at the limit of plausible), plus 1 if it continues a run: the pair just before or after
+    // it on the diagonal moves the same way. A part that moves against the rest (a buddy's foot mid-step) is
+    // such a run, face by face with itself; taking each face's nearest equal one instead followed the body's
+    // motion, paired the feet's faces with each other's and tore the feet into shards in the in-between
+    // frames. A grid of equal tiles shifted by one tile also runs, but its strays cost it the run's worth.
+    // The pairs are looked for near the diagonal; the best chain of them is a weighted longest increasing
+    // subsequence (a Fenwick tree of the best chain ending at or before each A rank).
+    const int BAND = 48; // how far the alignment may stray from the diagonal (faces gained or lost on one side)
+    const float RUN = 3; // native pixels: pairs whose moves differ by at most this continue each other
+    struct Cand { int i, j, prev; float dx, dy, w; double score; };
+    static std::vector<Cand> cands;
+    static std::vector<int> row_start;
+    static std::vector<double> fw_score;
+    static std::vector<int> fw_cand;
+    static std::vector<u64> ra_key; // the previous frame's key and centre by rank, for the tight loop below
+    static std::vector<float> ra_cx, ra_cy;
+    ra_key.resize(oa.size());
+    ra_cx.resize(oa.size());
+    ra_cy.resize(oa.size());
+    for (size_t r = 0; r < oa.size(); r++) { ra_key[r] = A[oa[r]].key; ra_cx[r] = A[oa[r]].cx; ra_cy[r] = A[oa[r]].cy; }
     for (size_t g = 0; g + 1 < chain.size(); g++) {
-        int b0 = chain[g].first + 1, b1 = chain[g + 1].first;
-        int a0 = chain[g].second + 1, a1 = chain[g + 1].second;
-        int p = a0;
-        for (int rb = b0; rb < b1; rb++) {
-            Prim& b = B[ob[rb]];
+        const int b0 = chain[g].first + 1, n = chain[g + 1].first - b0;  // B ranks b0 .. b0 + n - 1: rows 1..n
+        const int a0 = chain[g].second + 1, m = chain[g + 1].second - a0; // A ranks a0 .. a0 + m - 1: columns 1..m
+        if (n <= 0 || m <= 0) continue;
+        const int band = BAND + (m + n - 1) / n;
+        const float eps = 0.25f / std::max(n, m); // the shape tie-breaks add up to less than a quarter pair
+        cands.clear();
+        row_start.assign(n + 2, 0);
+        for (int i = 1; i <= n; i++) {
+            row_start[i] = (int)cands.size();
+            const Prim& b = B[ob[b0 + i - 1]];
             if (b.match >= 0) continue;
-            int best = -1, best_ra = -1;
-            float best_c = 1e30f;
-            for (int ra = p; ra < a1 && ra < p + WINDOW; ra++) {
-                int i = oa[ra];
-                if (taken[i] || A[i].key != b.key || !plausible(A[i], b)) continue;
-                float c = cost(A[i], b);
-                if (c < best_c) { best_c = c; best = i; best_ra = ra; }
+            const float tol = std::max(16.0f, std::max(b.bw, b.bh));
+            const int c = cell(b.cx, b.cy);
+            const float ox = b.cx - mx[c], oy = b.cy - my[c]; // where the local motion says it came from
+            const int j0 = std::max(1, (int)((long long)i * m / n) - band), j1 = std::min(m, (int)(((long long)i * m + n - 1) / n) + band);
+            for (int j = j0; j <= j1; j++) {
+                const int ra = a0 + j - 1;
+                // fit's own motion test, cheaply first: most equal primitives in a long run are far away
+                if (ra_key[ra] != b.key || std::fabs(ra_cx[ra] - ox) > tol || std::fabs(ra_cy[ra] - oy) > tol) continue;
+                const int ia = oa[ra];
+                if (taken[ia]) continue;
+                const float f = fit(A[ia], b);
+                if (f < 0) continue;
+                cands.push_back({i, j, -1, b.cx - A[ia].cx, b.cy - A[ia].cy,
+                                 1 - std::min(cost(A[ia], b) / (tol * tol), 1.0f) + eps * f, 0});
             }
-            if (best < 0) continue;
-            b.match = best;
+        }
+        row_start[n + 1] = (int)cands.size();
+        if (cands.empty()) continue;
+        auto continues = [&](const Cand& p, int i, int j) { // a candidate (i, j) that moves as p does
+            if (i < 1 || i > n) return false;
+            for (int q = row_start[i]; q < row_start[i + 1]; q++)
+                if (cands[q].j == j) {
+                    const float ex = p.dx - cands[q].dx, ey = p.dy - cands[q].dy;
+                    return ex * ex + ey * ey <= RUN * RUN;
+                }
+            return false;
+        };
+        fw_score.assign(m + 1, 0);
+        fw_cand.assign(m + 1, -1);
+        int best = -1;
+        for (int i = 1; i <= n; i++)
+            for (int q = row_start[i + 1] - 1; q >= row_start[i]; q--) { // a row's columns downwards: one pair per row
+                Cand& p = cands[q];
+                const float worth = p.w + (continues(p, i - 1, p.j - 1) || continues(p, i + 1, p.j + 1) ? 1 : 0);
+                if (worth <= 0) continue;
+                double s = 0;
+                for (int k = p.j - 1; k > 0; k -= k & -k)
+                    if (fw_score[k] > s) { s = fw_score[k]; p.prev = fw_cand[k]; }
+                p.score = s + worth;
+                for (int k = p.j; k <= m; k += k & -k)
+                    if (p.score > fw_score[k]) { fw_score[k] = p.score; fw_cand[k] = q; }
+                if (best < 0 || p.score > cands[best].score) best = q;
+            }
+        for (int q = best; q >= 0; q = cands[q].prev) {
+            Prim& b = B[ob[b0 + cands[q].i - 1]];
+            const int ia = oa[a0 + cands[q].j - 1];
+            b.match = ia;
             b.how = 2;
-            taken[best] = 1;
+            taken[ia] = 1;
             matched++;
-            p = best_ra + 1;
         }
     }
 
@@ -334,14 +400,20 @@ void match() {
     }
 
     // 4. the rest (a face hidden in the previous frame, a part that changed shape) moves like the matched
-    //    primitives next to it in build order and on screen: most likely the same object. A weighted average,
-    //    so neighbouring leftovers move together and the object stays in one piece.
+    //    primitives next to it in build order and on screen: most likely the same object. Corners it shares
+    //    with them (the same position) move as theirs do, so it stays joined to its own part; its other
+    //    corners, by the average of those, and a face that shares none, by a weighted average of the
+    //    neighbours' moves, so neighbouring leftovers move together and the object stays in one piece. (The
+    //    average alone took in the other foot, a few primitives away, and opened spikes at the shared corners.)
+    const float osx = (float)(s_cur.ox - s_prev.ox), osy = (float)(s_cur.oy - s_prev.oy);
     for (int rb = 0; rb < (int)ob.size(); rb++) {
         Prim& b = B[ob[rb]];
         b.inherit = false;
         if (b.match < 0) b.how = 0;
         if (b.match >= 0) continue;
-        float sx = 0, sy = 0, sw = 0;
+        const int nv = b.kind == K_POLY || b.kind == K_LINE ? b.n : 1;
+        float sx = 0, sy = 0, sw = 0, cx[4] = {}, cy[4] = {};
+        int cn[4] = {};
         for (int k = 1; k <= 8; k++)
             for (int side = -1; side <= 1; side += 2) {
                 int r = rb + side * k;
@@ -354,13 +426,28 @@ void match() {
                 sx += w * (n.cx - A[n.match].cx);
                 sy += w * (n.cy - A[n.match].cy);
                 sw += w;
+                if (nv < 2 || (n.kind != K_POLY && n.kind != K_LINE)) continue;
+                const Prim& na = A[n.match];
+                for (int q = 0; q < nv; q++)
+                    for (int t = 0; t < n.n; t++)
+                        if (b.v[q].x == n.v[t].x && b.v[q].y == n.v[t].y) {
+                            cx[q] += n.v[t].x - na.v[t].x - osx;
+                            cy[q] += n.v[t].y - na.v[t].y - osy;
+                            cn[q]++;
+                        }
             }
-        if (sw > 0) {
-            b.ix = sx / sw;
-            b.iy = sy / sw;
-            b.inherit = true;
-            b.how = 4;
+        if (sw <= 0) continue;
+        float mx_shared = 0, my_shared = 0;
+        int shared = 0;
+        for (int q = 0; q < nv; q++)
+            if (cn[q]) { cx[q] /= cn[q]; cy[q] /= cn[q]; mx_shared += cx[q]; my_shared += cy[q]; shared++; }
+        for (int q = 0; q < nv; q++) {
+            if (cn[q]) { b.ivx[q] = cx[q]; b.ivy[q] = cy[q]; }
+            else if (shared) { b.ivx[q] = mx_shared / shared; b.ivy[q] = my_shared / shared; }
+            else { b.ivx[q] = sx / sw; b.ivy[q] = sy / sw; }
         }
+        b.inherit = true;
+        b.how = 4;
     }
     s_matched = ob.empty() ? 0 : (float)matched / ob.size();
     displacements(s_prev, s_cur);
@@ -386,8 +473,19 @@ void match() {
                 o += snprintf(line + o, sizeof line - o, " <- #%d", rank_a[b.match]);
                 for (int k = 0; k < (a.kind == K_RECT ? 1 : a.n); k++) o += snprintf(line + o, sizeof line - o, " (%d,%d)", a.v[k].x - s_prev.ox, a.v[k].y - s_prev.oy);
             } else if (b.inherit) {
-                o += snprintf(line + o, sizeof line - o, " moves %.1f,%.1f", b.ix, b.iy);
+                o += snprintf(line + o, sizeof line - o, " moves");
+                for (int k = 0; k < (b.kind == K_RECT ? 1 : b.n); k++) o += snprintf(line + o, sizeof line - o, " %.1f,%.1f", b.ivx[k], b.ivy[k]);
             }
+            plog("%s\n", line);
+        }
+        plog("interp dump: the previous frame\n");
+        for (int ra = 0; ra < (int)oa.size(); ra++) {
+            const Prim& a = A[oa[ra]];
+            if (a.cx < x0 || a.cx > x1 || a.cy < y0 || a.cy > y1) continue;
+            char line[512];
+            int o = snprintf(line, sizeof line, "  #%d %s k%d n%d f%X", ra, taken[oa[ra]] ? "taken" : "free", a.kind, a.n, a.flags);
+            for (int k = 0; k < (a.kind == K_RECT ? 1 : a.n); k++)
+                o += snprintf(line + o, sizeof line - o, " (%d,%d)", a.v[k].x - s_prev.ox, a.v[k].y - s_prev.oy);
             plog("%s\n", line);
         }
     }

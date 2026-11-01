@@ -10,7 +10,7 @@ native code. No emulator and no BIOS file. Bring your own disc.
 ## Features
 
 - A launcher (Windows) with the settings, the disc check, saves and the patch notes.
-- Hardware renderer, Direct3D 11 on Windows and Vulkan on Linux: 1x–8x resolution, widescreen,
+- Hardware renderer, Direct3D 11 on Windows and Vulkan on Linux: 1x–8x resolution (or matched to your screen), widescreen,
   FXAA/MSAA/SSAA, xBR texture filtering, HD text
   and HUD numbers, 60 fps or more (up to 500, or the monitor's rate) with in-between frames while the game
   keeps its speed.
@@ -18,6 +18,7 @@ native code. No emulator and no BIOS file. Bring your own disc.
 - Controllers through SDL3 (Xbox, DualSense, DualShock 4, Switch Pro and more) with rumble; button prompts
   follow the device you use. Full keyboard play.
 - Saves as files, with the previous version of each kept.
+- Discord status (Rich Presence): shows you're playing and where (menus, story map, battle).
 
 ## Getting started
 

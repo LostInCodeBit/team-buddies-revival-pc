@@ -1,6 +1,7 @@
 // spu.cpp - Sound Processing Unit: 24 ADPCM voices, ADSR, reverb, CD audio mixing.
 #include "psx.h"
 #include <algorithm>
+#include <cmath>
 
 static u8 s_ram[512 * 1024];
 static u16 s_reg[0x200];          // raw register file (0x1F801C00 .. 0x1F801FFF) in halfwords
@@ -201,6 +202,16 @@ static void reverb(s32 lin, s32 rin) {
 }
 
 // ---------------------------------------------------------------- mixing
+// volume above 100%: the gain, then a soft knee above 3/4 of full scale, so loud parts round off instead of
+// clipping hard (which crackles)
+static s32 boost(s32 x, int volume) {
+    const float knee = 24576.0f, room = 32767.0f - knee;
+    float y = x * (volume / 100.0f), a = std::fabs(y);
+    if (a <= knee) return (s32)y;
+    a = knee + room * std::tanh((a - knee) / room);
+    return (s32)(y < 0 ? -a : a);
+}
+
 static inline s32 vol(u16 v) {
     if (v & 0x8000) return 0x7FFF; // sweep mode: approximate as full volume
     return (s16)(v << 1);
@@ -276,8 +287,13 @@ void spu_tick(int samples) {
         l = (l * vol(R(0x180))) >> 15;
         r = (r * vol(R(0x182))) >> 15;
         if (!(cnt & 0x4000) || !(cnt & 0x8000)) l = r = 0;
-        l = l * g_settings.volume / 100;
-        r = r * g_settings.volume / 100;
+        if (g_settings.volume <= 100) {
+            l = l * g_settings.volume / 100;
+            r = r * g_settings.volume / 100;
+        } else {
+            l = boost(l, g_settings.volume);
+            r = boost(r, g_settings.volume);
+        }
         out[n * 2] = (s16)std::clamp(l, -32768, 32767);
         out[n * 2 + 1] = (s16)std::clamp(r, -32768, 32767);
     }

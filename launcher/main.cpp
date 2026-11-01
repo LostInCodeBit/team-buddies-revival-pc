@@ -3,6 +3,7 @@
 // it hides while the game runs and comes back, re-reading the ini, when the game exits.
 #include "ui.h"
 #include "settings.h"
+#include "update.h"
 #include <commdlg.h>
 #include <objbase.h>
 #include <dwmapi.h>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <cwctype>
 #include <fstream>
 
 #pragma comment(lib, "dwmapi.lib")
@@ -23,7 +25,7 @@
 static const wchar_t* kClass = L"TeamBuddiesLauncher";
 static const float kWinW = 1040, kWinH = 680;  // DIPs
 static const float kNavW = 248, kFooterH = 80, kTitleH = 36;
-enum { WM_GAME_EXITED = WM_APP + 1 };
+enum { WM_GAME_EXITED = WM_APP + 1, WM_UPDATE_CHECKED, WM_UPDATE_INSTALLED };
 
 // ---------------------------------------------------------------- text helpers
 static std::wstring widen(const std::string& s, UINT cp = CP_ACP) {
@@ -88,6 +90,12 @@ static HANDLE s_game;              // running game process
 static std::wstring s_snack;       // M3 snackbar message
 static ULONGLONG s_snack_until;
 static float s_notes_scroll;
+static std::wstring s_version;     // this build: the newest released version in the embedded CHANGELOG.md
+enum UpdateState { UPD_IDLE, UPD_CHECKING, UPD_LATEST, UPD_AVAILABLE, UPD_FAILED, UPD_INSTALLING, UPD_INSTALL_FAILED, UPD_RESTARTING };
+static int s_update = UPD_IDLE;
+static std::wstring s_update_tag;  // the newer release's version (UPD_AVAILABLE and after)
+static HANDLE s_mutex;             // one launcher at a time
+static int s_show = SW_SHOWNORMAL; // how the launcher was asked to show (its restart after an update does the same)
 
 struct DiscInfo { int state = 0; std::wstring title, detail; } static s_disc; // 0 none, 1 recognised, 2 other game, 3 missing
 struct SaveInfo { int count = 0; FILETIME newest = {}; bool legacy = false; } static s_save;
@@ -331,19 +339,147 @@ static void load_notes() {
     std::string md((const char*)LockResource(g), SizeofResource(nullptr, r));
     std::wstring all = widen(md, CP_UTF8);
     size_t p = 0;
+    bool joined = false; // the line before was text of the same paragraph (no blank line since)
     while (p <= all.size()) {
         size_t e = all.find(L'\n', p);
         std::wstring ln = all.substr(p, e == std::wstring::npos ? std::wstring::npos : e - p);
         p = e == std::wstring::npos ? all.size() + 1 : e + 1;
         while (!ln.empty() && (ln.back() == L'\r' || ln.back() == L' ')) ln.pop_back();
+        const bool follows = joined;
+        joined = false;
         if (ln.empty() || ln.rfind(L"# ", 0) == 0) continue;
+        if (follows && ln[0] != L'#' && ln.rfind(L"- ", 0) != 0) { // a paragraph wrapped over several lines
+            s_notes.back().text += L" " + strip_md(ln);
+            joined = true;
+            continue;
+        }
+        if (ln.rfind(L"## ", 0) == 0 && s_version.empty() && ln.size() > 3 && iswdigit(ln[3])) // "## 0.2.0 - 2026-10-31"
+            s_version = ln.substr(3, ln.find(L' ', 3) == std::wstring::npos ? std::wstring::npos : ln.find(L' ', 3) - 3);
         if (ln.rfind(L"## ", 0) == 0) s_notes.push_back({0, ln.substr(3)});
         else if (ln.rfind(L"### ", 0) == 0) s_notes.push_back({1, ln.substr(4)});
         else if (ln.rfind(L"- ", 0) == 0) s_notes.push_back({2, strip_md(ln.substr(2))});
         else if (ln.rfind(L"  ", 0) == 0 && !s_notes.empty() && s_notes.back().kind == 2) {
             size_t a = ln.find_first_not_of(L' ');
             s_notes.back().text += L" " + strip_md(ln.substr(a));
-        } else s_notes.push_back({3, strip_md(ln)});
+        } else {
+            s_notes.push_back({3, strip_md(ln)});
+            joined = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- updates (update.cpp)
+// The check runs when the launcher opens (check_updates in the ini) and from the side bar; an install from the
+// update card. Each runs on a worker thread that posts its result; the install's progress is polled for the bar.
+static std::wstring s_update_raw_tag;          // the newer release's tag as GitHub has it ("v0.3.0")
+static std::wstring s_update_error;            // why an install failed
+static std::wstring s_worker_tag, s_worker_err; // a worker's answer, written before it posts, read after
+static UpdateProgress s_progress;
+static bool s_update_quiet;  // the check at start: offline is no news, only a check the player asked for says so
+static bool s_update_auto;   // test harness (TB_UPDATE_AUTO): install what the check finds, then close
+static int s_cleanup_tries;  // after an update: the old launcher may still be closing, its files go a moment later
+
+static DWORD WINAPI check_worker(void*) {
+    std::wstring tag, err;
+    int result = UPD_FAILED;
+    if (update_latest(tag, err)) result = !tag.empty() && update_newer(tag, s_version) ? UPD_AVAILABLE : UPD_LATEST;
+    s_worker_tag = tag;
+    s_worker_err = err;
+    update_log(L"check: latest '%s' (this is %s) %s", tag.c_str(), s_version.c_str(), err.c_str());
+    PostMessageW(s_hwnd, WM_UPDATE_CHECKED, (WPARAM)result, 0);
+    return 0;
+}
+
+static DWORD WINAPI install_worker(void*) {
+    std::wstring err;
+    const bool ok = update_install(s_dir, s_update_raw_tag, s_progress, err);
+    s_worker_err = err;
+    if (!ok) update_log(L"install failed: %s", err.c_str());
+    PostMessageW(s_hwnd, WM_UPDATE_INSTALLED, ok, 0);
+    return 0;
+}
+
+static void check_updates(bool quiet = false) {
+    if (s_update == UPD_CHECKING || s_update == UPD_INSTALLING || s_update == UPD_RESTARTING) return;
+    s_update = UPD_CHECKING;
+    s_update_quiet = quiet;
+    HANDLE t = CreateThread(nullptr, 0, check_worker, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    else s_update = quiet ? UPD_IDLE : UPD_FAILED;
+    InvalidateRect(s_hwnd, nullptr, FALSE);
+}
+
+static void install_update() {
+    if (s_update != UPD_AVAILABLE && s_update != UPD_INSTALL_FAILED) return;
+    s_update = UPD_INSTALLING;
+    s_update_error.clear();
+    s_progress.phase = UPH_DOWNLOAD;
+    s_progress.done = s_progress.total = 0;
+    HANDLE t = CreateThread(nullptr, 0, install_worker, nullptr, 0, nullptr);
+    if (t) {
+        CloseHandle(t);
+        SetTimer(s_hwnd, 3, 100, nullptr); // redraws the progress bar
+    } else {
+        s_update = UPD_INSTALL_FAILED;
+        s_update_error = L"couldn't start the download";
+    }
+    InvalidateRect(s_hwnd, nullptr, FALSE);
+}
+
+static void update_checked(int result) {
+    s_update = result == UPD_FAILED && s_update_quiet ? UPD_IDLE : result;
+    if (result == UPD_AVAILABLE) {
+        s_update_raw_tag = s_worker_tag;
+        s_update_tag = s_worker_tag.size() > 1 && (s_worker_tag[0] == L'v' || s_worker_tag[0] == L'V') ? s_worker_tag.substr(1) : s_worker_tag;
+    }
+    if (s_update_auto) {
+        if (result == UPD_AVAILABLE) install_update();
+        else PostMessageW(s_hwnd, WM_CLOSE, 0, 0);
+    }
+    InvalidateRect(s_hwnd, nullptr, FALSE);
+}
+
+static void open_release() { ShellExecuteW(s_hwnd, L"open", update_release_page().c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+
+// the new files are in place: start the new launcher (it deletes the old files) and close this one
+static void restart_updated() {
+    if (s_mutex) { CloseHandle(s_mutex); s_mutex = nullptr; } // or the new one would find this one still running
+    std::wstring exe = s_dir + L"TeamBuddiesLauncher.exe", cmd = L"\"" + exe + L"\" --updated";
+    STARTUPINFOW si = {sizeof si};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = (WORD)s_show;
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, s_dir.c_str(), &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        DestroyWindow(s_hwnd);
+        return;
+    }
+    s_update = UPD_LATEST;
+    snack(L"Updated. Open the launcher again to use the new version.");
+}
+
+static void update_installed(bool ok) {
+    KillTimer(s_hwnd, 3);
+    if (ok) {
+        s_update = UPD_RESTARTING;
+        restart_updated();
+        return;
+    }
+    s_update = UPD_INSTALL_FAILED;
+    s_update_error = s_worker_err;
+    if (!s_update_error.empty()) s_update_error[0] = (wchar_t)towupper(s_update_error[0]);
+    if (s_update_auto) PostMessageW(s_hwnd, WM_CLOSE, 0, 0);
+    InvalidateRect(s_hwnd, nullptr, FALSE);
+}
+
+static void cleanup_tick() {
+    if (!s_cleanup_tries) return;
+    const bool clean = update_cleanup(s_dir);
+    if (clean || --s_cleanup_tries == 0) {
+        s_cleanup_tries = 0;
+        update_log(L"cleanup %s", clean ? L"done" : L"left files behind");
+        if (s_update_auto) PostMessageW(s_hwnd, WM_CLOSE, 0, 0);
     }
 }
 
@@ -351,13 +487,70 @@ static void load_notes() {
 enum Ids { // widget ids (segmented buttons use id*32+segment, keep these below 1000)
     ID_MIN = 1, ID_CLOSE, ID_SAVES, ID_NAV = 10, ID_TABS = 20, ID_RESET = 30, ID_CHOOSE, ID_PLAY, ID_PLAY_BIG, ID_DISC_ROW,
     ID_RENDERER = 40, ID_SCALE, ID_TRUECOLOR, ID_TEXFILTER, ID_VSYNC, ID_FRAMERATE, ID_AA, ID_HDTEXT,
-    ID_DISPLAY = 50, ID_WINSIZE, ID_ASPECT, ID_SCALING, ID_WIDESCREEN,
-    ID_SKIPINTRO = 60, ID_CPU, ID_VOLUME, ID_MULTITAP,
+    ID_DISPLAY = 50, ID_WINSIZE, ID_ASPECT, ID_SCALING, ID_WIDESCREEN, ID_SHOWFPS, ID_FSRES,
+    ID_SKIPINTRO = 60, ID_CPU, ID_VOLUME, ID_MULTITAP, ID_DISCORD,
     ID_ICONS = 70, ID_VIBRATION,
+    ID_UPDATE = 80, ID_UPDATE_AUTO, ID_UPDATE_PAGE, ID_UPDATE_BAR,
 };
 
 static float content_x() { return kNavW + 40; }
 static float content_w() { return ui::W - kNavW - 80; }
+
+// bottom of the navigation rail: this build's version, and the update check; a newer release shows as a
+// crate-yellow card with the way to get it
+static void update_panel() {
+    using namespace ui;
+    const float bottom = H - kFooterH;
+    std::wstring date = widen(__DATE__); // "Nov  1 2026": one space, not the padding of a one-digit day
+    for (size_t i; (i = date.find(L"  ")) != std::wstring::npos;) date.erase(i, 1);
+    std::wstring ver = (s_version.empty() ? L"" : L"v" + s_version + L" · ") + L"built " + date;
+    text(ver, {28, bottom - 34, kNavW - 40, 20}, F_BODY_SMALL, col::alpha(col::on_surface_variant, 0.7f));
+    const u32 ink = col::on_tertiary_container, ink2 = col::alpha(col::on_tertiary_container, 0.8f);
+    if (s_update == UPD_AVAILABLE) {
+        Rc c = {16, bottom - 164, kNavW - 32, 124};
+        fill(c, col::tertiary_container, 16);
+        text(L"Version " + s_update_tag + L" is out", {c.x + 16, c.y + 14, c.w - 32, 24}, F_LABEL, ink);
+        text(s_version.empty() ? L"A newer version" : L"You have " + s_version, {c.x + 16, c.y + 38, c.w - 32, 20}, F_BODY_SMALL, ink2);
+        if (button_tertiary(ID_UPDATE, {c.x + 16, c.y + 72, c.w - 32, 36}, L"Update now", ic::download)) install_update();
+        return;
+    }
+    if (s_update == UPD_INSTALLING || s_update == UPD_RESTARTING) {
+        // M3 linear progress: the download's share, then full while the files are checked and swapped
+        Rc c = {16, bottom - 132, kNavW - 32, 92};
+        fill(c, col::tertiary_container, 16);
+        const int phase = s_progress.phase;
+        const long long done = s_progress.done, total = s_progress.total;
+        std::wstring title = s_update == UPD_RESTARTING ? L"Installed " : phase == UPH_DOWNLOAD ? L"Downloading " : L"Installing ";
+        text(title + s_update_tag, {c.x + 16, c.y + 14, c.w - 32, 24}, F_LABEL, ink);
+        Rc bar = {c.x + 16, c.y + 46, c.w - 32, 4};
+        float share = s_update == UPD_RESTARTING || phase != UPH_DOWNLOAD ? 1.0f : total > 0 ? (float)std::min(1.0, (double)done / total) : 0.0f;
+        fill(bar, col::alpha(ink, 0.24f), 2);
+        if (share > 0) fill({bar.x, bar.y, std::max(4.0f, bar.w * anim(ID_UPDATE_BAR, share, 12)), bar.h}, col::tertiary, 2);
+        wchar_t detail[64];
+        if (s_update == UPD_RESTARTING) swprintf(detail, 64, L"Restarting…");
+        else if (phase == UPH_CHECK) swprintf(detail, 64, L"Checking the files");
+        else if (phase == UPH_REPLACE) swprintf(detail, 64, L"Replacing the files");
+        else if (total > 0) swprintf(detail, 64, L"%.1f of %.1f MB", done / 1048576.0, total / 1048576.0);
+        else swprintf(detail, 64, L"%.1f MB", done / 1048576.0);
+        text(detail, {c.x + 16, c.y + 58, c.w - 32, 20}, F_BODY_SMALL, ink2);
+        return;
+    }
+    if (s_update == UPD_INSTALL_FAILED) {
+        // nothing was changed: try again, or take the release by hand
+        Rc c = {16, bottom - 222, kNavW - 32, 182};
+        fill(c, col::surface_high, 16);
+        text(L"Update failed", {c.x + 16, c.y + 14, c.w - 32, 24}, F_LABEL, col::error);
+        text(s_update_error + L". Your files are unchanged.", {c.x + 16, c.y + 38, c.w - 32, 52}, F_BODY_SMALL, col::on_surface_variant, A_LEFT, true);
+        if (button_tonal(ID_UPDATE, {c.x + 16, c.y + 94, c.w - 32, 36}, L"Try again", ic::sync)) install_update();
+        if (button_text(ID_UPDATE_PAGE, {c.x + 16, c.y + 134, c.w - 32, 36}, L"Get it from GitHub", ic::download)) open_release();
+        return;
+    }
+    const bool busy = s_update == UPD_CHECKING;
+    const std::wstring label = busy ? L"Checking…" : L"Check for updates";
+    if (button_text(ID_UPDATE, {16, bottom - 98, text_width(label, F_LABEL) + 18 + 8 + 32, 36}, label, ic::sync, !busy)) check_updates();
+    if (s_update == UPD_LATEST) text(L"You have the latest version", {28, bottom - 58, kNavW - 40, 20}, F_BODY_SMALL, col::success);
+    else if (s_update == UPD_FAILED) text(L"Couldn't reach GitHub", {28, bottom - 58, kNavW - 40, 20}, F_BODY_SMALL, col::error);
+}
 
 static void nav() {
     using namespace ui;
@@ -379,7 +572,7 @@ static void nav() {
         text(items[i].label, {r.x + 56, r.y, r.w - 64, r.h}, F_LABEL, sel ? col::on_secondary_container : col::on_surface);
         if (clicked(ID_NAV + i, r) && s_page != i) { s_page = i; s_notes_scroll = 0; close_popup(); request_frame(); }
     }
-    text(L"Built " + widen(__DATE__), {28, H - kFooterH - 40, kNavW - 40, 20}, F_BODY_SMALL, col::alpha(col::on_surface_variant, 0.7f));
+    update_panel();
 }
 
 static void title_bar() {
@@ -401,7 +594,8 @@ static void footer() {
     text(t, {52, f.y + 18, W - bw - cw - 120, 22}, F_TITLE, col::on_surface);
     text(d, {52, f.y + 40, W - bw - cw - 120, 20}, F_BODY_SMALL, col::on_surface_variant);
     if (button_outlined(ID_CHOOSE, {W - 28 - bw - 12 - cw, f.y + 18, cw, 44}, L"Choose disc", ic::disc)) choose_disc();
-    if (button_filled(ID_PLAY, {W - 28 - bw, f.y + 18, bw, 44}, L"Play", ic::play, s_disc.state == 1 || s_disc.state == 2)) play();
+    const bool updating = s_update == UPD_INSTALLING || s_update == UPD_RESTARTING; // the game's files may be mid-swap
+    if (button_filled(ID_PLAY, {W - 28 - bw, f.y + 18, bw, 44}, L"Play", ic::play, (s_disc.state == 1 || s_disc.state == 2) && !updating)) play();
 }
 
 static void snackbar() {
@@ -517,13 +711,50 @@ static void page_play() {
 static const struct { int w, h; } kSizes[] = {{960, 720}, {1280, 960}, {1440, 1080}, {1600, 1200}, {1920, 1440},
                                               {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}};
 
+// "1920 × 1080  (16:9)": the common shapes named, within 3%
+static std::wstring size_label(int w, int h) {
+    static const struct { int a, b; const wchar_t* name; } shapes[] = {
+        {16, 9, L"16:9"}, {16, 10, L"16:10"}, {4, 3, L"4:3"}, {5, 4, L"5:4"}, {21, 9, L"21:9"}, {32, 9, L"32:9"}};
+    std::wstring s = std::to_wstring(w) + L" × " + std::to_wstring(h);
+    for (const auto& k : shapes)
+        if (std::abs(w * k.b - h * k.a) * 100 <= 3 * h * k.a) return s + L"  (" + k.name + L")";
+    return s;
+}
+
+// the resolutions of the main monitor (where the game opens), widest first, without the desktop's own
+struct ScreenModes {
+    int desk_w = 0, desk_h = 0;
+    std::vector<std::pair<int, int>> sizes;
+};
+static const ScreenModes& screen_modes() {
+    static ScreenModes m;
+    static bool done;
+    if (done) return m;
+    done = true;
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi)) return m;
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof dm;
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) { m.desk_w = (int)dm.dmPelsWidth; m.desk_h = (int)dm.dmPelsHeight; }
+    for (DWORD i = 0; EnumDisplaySettingsW(mi.szDevice, i, &dm); i++) {
+        std::pair<int, int> z = {(int)dm.dmPelsWidth, (int)dm.dmPelsHeight};
+        if (dm.dmBitsPerPel != 32 || (dm.dmDisplayFlags & DM_INTERLACED) || z.first < 640 || z.second < 480 ||
+            z == std::make_pair(m.desk_w, m.desk_h) || std::find(m.sizes.begin(), m.sizes.end(), z) != m.sizes.end())
+            continue;
+        m.sizes.push_back(z);
+    }
+    std::sort(m.sizes.begin(), m.sizes.end(), [](const auto& a, const auto& b) { return a > b; }); // widest first
+    return m;
+}
+
 static void reset_tab() {
     Settings d;
     Settings& s = g_settings;
     switch (s_tab) {
     case 0: s.renderer = d.renderer; s.scale = d.scale; s.anti_aliasing = d.anti_aliasing; s.frame_rate = d.frame_rate; s.true_color = d.true_color; s.texture_filter = d.texture_filter; s.hd_text = d.hd_text; break;
-    case 1: s.display = d.display; s.window_w = d.window_w; s.window_h = d.window_h; s.aspect = d.aspect; s.bilinear = d.bilinear; s.widescreen = d.widescreen; s.vsync = d.vsync; break;
-    case 2: s.skip_intro = d.skip_intro; s.cpu_cpi = d.cpu_cpi; s.volume = d.volume; break;
+    case 1: s.display = d.display; s.window_w = d.window_w; s.window_h = d.window_h; s.fullscreen_w = d.fullscreen_w; s.fullscreen_h = d.fullscreen_h; s.aspect = d.aspect; s.bilinear = d.bilinear; s.widescreen = d.widescreen; s.vsync = d.vsync; s.show_fps = d.show_fps; break;
+    case 2: s.skip_intro = d.skip_intro; s.cpu_cpi = d.cpu_cpi; s.volume = d.volume; s.check_updates = d.check_updates; s.discord = d.discord; break;
     case 3: s.button_icons = d.button_icons; s.vibration = d.vibration; s.multitap = d.multitap; break;
     }
     save();
@@ -555,21 +786,31 @@ static void page_settings() {
     fill({ix + 8, ty + 45, iw - 16, 3}, col::primary, 1.5f);
 
     bool hw = s.renderer == 1;
-    s_rows = s_tab == 0 ? 7 : 6;
+    s_rows = s_tab <= 1 ? 7 : 6;
     switch (s_tab) {
     case 0: {
         std::vector<std::wstring> ren = {L"Hardware", L"Software"};
         int v = hw ? 0 : 1;
         if (segmented(ID_RENDERER, row(0, L"Renderer", L"Hardware upscales on your GPU; Software draws the original picture", segmented_width(ren)), ren, v)) { s.renderer = v == 0; save(); }
-        std::vector<std::wstring> sc;
+        // first "screen": the multiple that fills what the picture is shown on, the window or the screen at the
+        // Display tab's resolution (the game works it out again from the real window, and as it resizes)
+        const bool win = s.display == DISPLAY_WINDOW;
+        int ow = s.window_w, oh = s.window_h;
+        if (!win && s.display == DISPLAY_FULLSCREEN && s.fullscreen_w > 0) { ow = s.fullscreen_w; oh = s.fullscreen_h; }
+        else if (!win && screen_modes().desk_w > 0) { ow = screen_modes().desk_w; oh = screen_modes().desk_h; }
+        const int fill = screen_scale(s, ow, oh, false);
+        std::vector<std::wstring> sc = {(win ? L"Window · " : L"Screen · ") + std::to_wstring(ow) + L" × " + std::to_wstring(oh)};
         for (int k = 1; k <= 8; k++) sc.push_back(std::to_wstring(k) + L"x · " + std::to_wstring(320 * k) + L" × " + std::to_wstring(240 * k) + (k == 1 ? L" (original)" : L""));
-        int sv = s.scale - 1;
-        if (dropdown(ID_SCALE, row(1, L"Resolution", L"How sharp the 3D picture is drawn (F2/F3 in game)", 240, hw), sc, sv, hw)) { s.scale = sv + 1; save(); }
+        int sv = s.scale == SCALE_SCREEN ? 0 : s.scale;
+        std::wstring scsub = s.scale != SCALE_SCREEN ? L"How sharp the 3D picture is drawn (F2/F3 in game)"
+                           : (win ? L"Sharp enough to fill the window: " : L"Sharp enough to fill your screen: ") + std::to_wstring(fill) + L"x (F2/F3 in game)";
+        if (dropdown(ID_SCALE, row(1, L"Resolution", scsub, 240, hw), sc, sv, hw)) { s.scale = sv == 0 ? SCALE_SCREEN : sv; save(); }
         // anti-aliasing; the game caps the samples so the multisampled VRAM stays within 512 MB
         std::vector<std::wstring> aa = {L"Off", L"FXAA", L"MSAA 2x", L"MSAA 4x", L"MSAA 8x", L"SSAA 2x", L"SSAA 4x", L"SSAA 8x"};
         int aav = std::clamp(s.anti_aliasing, 0, AA_COUNT - 1);
         int cap = 8;
-        while (cap > 1 && cap * s.scale * s.scale > 256) cap /= 2;
+        const int eff = s.scale == SCALE_SCREEN ? fill : s.scale;
+        while (cap > 1 && cap * eff * eff > 256) cap /= 2;
         std::wstring capped = aa_samples(aav) > cap ? L" (" + std::to_wstring(cap) + L" samples at this resolution)" : L"";
         std::wstring aasub = !hw ? L"Needs the hardware renderer"
                            : aav == AA_OFF ? L"Smooths jagged edges (F1 in game)"
@@ -605,30 +846,56 @@ static void page_settings() {
     case 1: {
         std::vector<std::wstring> dm = {L"Window", L"Borderless", L"Fullscreen"};
         if (segmented(ID_DISPLAY, row(0, L"Display", L"F11 or Alt+Enter switches in game", segmented_width(dm)), dm, s.display)) save();
-        std::vector<std::wstring> ws;
-        int wv = -1;
-        for (int k = 0; k < (int)(sizeof kSizes / sizeof kSizes[0]); k++) {
-            ws.push_back(std::to_wstring(kSizes[k].w) + L" × " + std::to_wstring(kSizes[k].h) + (kSizes[k].w * 3 == kSizes[k].h * 4 ? L"  (4:3)" : L"  (16:9)"));
-            if (kSizes[k].w == s.window_w && kSizes[k].h == s.window_h) wv = k;
-        }
-        if (wv < 0) { ws.push_back(std::to_wstring(s.window_w) + L" × " + std::to_wstring(s.window_h) + L"  (your size)"); wv = (int)ws.size() - 1; }
-        bool win = s.display == DISPLAY_WINDOW;
-        if (dropdown(ID_WINSIZE, row(1, L"Window size", win ? L"Size of the game window when it opens" : L"Only for Display: Window", 240, win), ws, wv, win) &&
-            wv < (int)(sizeof kSizes / sizeof kSizes[0])) {
-            s.window_w = kSizes[wv].w;
-            s.window_h = kSizes[wv].h;
-            save();
+        if (s.display == DISPLAY_WINDOW) {
+            std::vector<std::wstring> ws;
+            int wv = -1;
+            for (int k = 0; k < (int)(sizeof kSizes / sizeof kSizes[0]); k++) {
+                ws.push_back(size_label(kSizes[k].w, kSizes[k].h));
+                if (kSizes[k].w == s.window_w && kSizes[k].h == s.window_h) wv = k;
+            }
+            if (wv < 0) { ws.push_back(std::to_wstring(s.window_w) + L" × " + std::to_wstring(s.window_h) + L"  (your size)"); wv = (int)ws.size() - 1; }
+            if (dropdown(ID_WINSIZE, row(1, L"Window size", L"Size of the game window when it opens", 240), ws, wv) && wv < (int)(sizeof kSizes / sizeof kSizes[0])) {
+                s.window_w = kSizes[wv].w;
+                s.window_h = kSizes[wv].h;
+                save();
+            }
+        } else {
+            // the screen's resolution: Fullscreen switches the monitor to it, Borderless keeps the desktop's
+            const ScreenModes& sm = screen_modes();
+            const bool ex = s.display == DISPLAY_FULLSCREEN;
+            std::vector<std::wstring> rs = {sm.desk_w > 0 ? L"Desktop · " + std::to_wstring(sm.desk_w) + L" × " + std::to_wstring(sm.desk_h) : L"Desktop"};
+            std::vector<std::pair<int, int>> rv = {{0, 0}};
+            for (const auto& z : sm.sizes) { rs.push_back(size_label(z.first, z.second)); rv.push_back(z); }
+            int v = 0;
+            if (ex && s.fullscreen_w > 0 && !(s.fullscreen_w == sm.desk_w && s.fullscreen_h == sm.desk_h)) {
+                auto it = std::find(rv.begin(), rv.end(), std::make_pair(s.fullscreen_w, s.fullscreen_h));
+                if (it != rv.end()) v = (int)(it - rv.begin());
+                else {
+                    rs.push_back(std::to_wstring(s.fullscreen_w) + L" × " + std::to_wstring(s.fullscreen_h) + L"  (not on this screen)");
+                    rv.push_back({s.fullscreen_w, s.fullscreen_h});
+                    v = (int)rv.size() - 1;
+                }
+            }
+            if (dropdown(ID_FSRES, row(1, L"Screen resolution", ex ? L"Your screen switches to this while you play" : L"Borderless uses your desktop's; Fullscreen can change it", 240, ex), rs, v, ex)) {
+                s.fullscreen_w = rv[v].first;
+                s.fullscreen_h = rv[v].second;
+                save();
+            }
         }
         std::vector<std::wstring> asp = {L"4:3", L"16:9", L"Wide", L"Stretch", L"Pixels"};
-        static const wchar_t* asp_sub[] = {L"The original shape (F6 cycles in game)", L"Always 16:9", L"Fills your screen's shape; pair it with Widescreen",
+        static const wchar_t* asp_sub[] = {L"The original shape (F6 cycles in game)", L"Always 16:9", L"Fills your screen's shape (with Widescreen)",
                                            L"Fills the window, whatever its shape", L"Whole-number scaling: every pixel the same size"};
-        int av = s.aspect;
-        if (segmented(ID_ASPECT, row(2, L"Aspect", asp_sub[std::clamp(s.aspect, 0, 4)], segmented_width(asp)), asp, av)) { s.aspect = av; save(); }
+        // the buttons' order is not the setting's: Wide and Stretch swap places
+        static const int asp_mode[] = {ASPECT_4_3, ASPECT_16_9, ASPECT_WIDE, ASPECT_STRETCH, ASPECT_PIXELS};
+        int av = 0;
+        for (int i = 0; i < 5; i++) if (asp_mode[i] == s.aspect) av = i;
+        if (segmented(ID_ASPECT, row(2, L"Aspect", asp_sub[av], segmented_width(asp)), asp, av)) { s.aspect = asp_mode[av]; save(); }
         std::vector<std::wstring> scl = {L"Sharp", L"Smooth"};
         int bv = s.bilinear ? 1 : 0;
         if (segmented(ID_SCALING, row(3, L"Scaling", L"How the picture is enlarged to fit the window (F5)", segmented_width(scl)), scl, bv)) { s.bilinear = bv == 1; save(); }
         if (toggle(ID_WIDESCREEN, row(4, L"Widescreen", L"Widens the 3D view (F4); the HUD stretches and edges can pop in", 52), s.widescreen)) save();
         if (toggle(ID_VSYNC, row(5, L"V-Sync", L"Waits for the monitor, so the picture never tears", 52), s.vsync)) save();
+        if (toggle(ID_SHOWFPS, row(6, L"FPS counter", L"Frames shown per second and the game's own, top left (Shift+F10)", 52), s.show_fps)) save();
         break;
     }
     case 2: {
@@ -639,12 +906,17 @@ static void page_settings() {
         static const double cpis[] = {2.0, 1.5, 1.0};
         int cv = s.cpu_cpi >= 1.75 ? 0 : s.cpu_cpi >= 1.25 ? 1 : 2;
         if (segmented(ID_CPU, row(2, L"CPU speed", L"Faster removes slowdown in busy fights; Original matches the console", segmented_width(cpu)), cpu, cv)) { s.cpu_cpi = cpis[cv]; save(); }
-        Rc vr = row(3, L"Volume", L"Music, speech and sound effects", 280);
+        Rc vr = row(3, L"Volume", L"Music, speech and sound effects; 100% is the original", 280);
         int vol = s.volume;
-        if (slider(ID_VOLUME, {vr.x + 10, vr.y, vr.w - 70, vr.h}, vol, 0, 100)) { s.volume = vol; request_frame(); }
+        Rc track = {vr.x + 10, vr.y, vr.w - 70, vr.h};
+        if (slider(ID_VOLUME, track, vol, 0, 200)) { s.volume = vol; request_frame(); }
+        // stop indicator at 100%, the original loudness (hidden under the handle)
+        if (std::abs(s.volume - 100) > 6) circle(track.x + track.w / 2, track.y + track.h / 2, 2, s.volume > 100 ? col::on_primary : col::primary);
         static int saved_volume = -1;
         if (!held(ID_VOLUME) && saved_volume != s.volume) { if (saved_volume >= 0) save(); saved_volume = s.volume; } // one write per drag
         text(std::to_wstring(s.volume) + L"%", {vr.r() - 48, vr.y, 48, vr.h}, F_LABEL, col::on_surface, A_RIGHT);
+        if (toggle(ID_UPDATE_AUTO, row(4, L"Check for updates", L"Looks for a new version on GitHub when the launcher opens", 52), s.check_updates)) save();
+        if (toggle(ID_DISCORD, row(5, L"Discord status", L"Your Discord profile shows you're playing, and where: menus or battle", 52), s.discord)) save();
         break;
     }
     case 3: {
@@ -722,13 +994,50 @@ static void shots(const std::wstring& dir) {
         s_tab = s.tab;
         ui::snapshot(dir + L"\\launcher_" + s.name + L".png", draw, 2);
     }
-    // the Graphics menus open: press and release on the field, then draw the menu
+    // the update check's answers (no network here: the states are set directly)
+    s_page = 0;
+    s_update_tag = L"9.9.9";
+    s_update_error = L"The release's signature is not valid";
+    struct U { int state, phase; const wchar_t* name; } updates[] = {
+        {UPD_CHECKING, 0, L"update_checking"}, {UPD_LATEST, 0, L"update_latest"}, {UPD_FAILED, 0, L"update_failed"},
+        {UPD_AVAILABLE, 0, L"update_available"}, {UPD_INSTALLING, UPH_DOWNLOAD, L"update_downloading"},
+        {UPD_INSTALLING, UPH_CHECK, L"update_installing"}, {UPD_RESTARTING, 0, L"update_restarting"}, {UPD_INSTALL_FAILED, 0, L"update_install_failed"}};
+    for (auto& u : updates) {
+        s_update = u.state;
+        s_progress.phase = u.phase;
+        s_progress.done = 4404019;
+        s_progress.total = 9856000;
+        ui::snapshot(dir + L"\\launcher_" + u.name + L".png", draw, 12); // the progress bar eases in
+    }
+    s_update = UPD_IDLE;
+    // TB_UPDATE_LIVE: also ask GitHub for real (the same request the launcher makes when it opens)
+    if (_wgetenv(L"TB_UPDATE_LIVE")) {
+        check_worker(nullptr); // posts to the window; take the answer here instead
+        MSG m;
+        if (PeekMessageW(&m, s_hwnd, WM_UPDATE_CHECKED, WM_UPDATE_CHECKED, PM_REMOVE)) update_checked((int)m.wParam);
+        ui::snapshot(dir + L"\\launcher_update_live.png", draw, 2);
+    }
+    // Display set to Fullscreen: the screen's resolutions
     s_page = 1;
+    s_tab = 1;
+    const int display = g_settings.display;
+    g_settings.display = DISPLAY_FULLSCREEN;
+    ui::close_popup();
+    ui::snapshot(dir + L"\\launcher_settings_display_fullscreen.png", draw, 2);
+    // Resolution set to the screen's (Display still Fullscreen)
+    const int scale = g_settings.scale;
+    g_settings.scale = SCALE_SCREEN;
     s_tab = 0;
+    ui::snapshot(dir + L"\\launcher_settings_graphics_screen.png", draw, 2);
+    // the menus open: press and release on the field, then draw the menu
     static int step, menu_id;
-    struct M { int id; const wchar_t* name; } menus[] = {{ID_SCALE, L"menu"}, {ID_AA, L"menu_aa"}, {ID_FRAMERATE, L"menu_framerate"}};
+    struct M { int tab, id; const wchar_t* name; bool screen; } menus[] = {
+        {0, ID_SCALE, L"menu"}, {0, ID_AA, L"menu_aa"}, {0, ID_FRAMERATE, L"menu_framerate"}, {1, ID_FSRES, L"menu_screen_res"},
+        {0, ID_SCALE, L"menu_scale_screen", true}};
     for (auto& m : menus) {
         ui::close_popup();
+        g_settings.scale = m.screen ? SCALE_SCREEN : scale;
+        s_tab = m.tab;
         step = 0;
         menu_id = m.id;
         ui::snapshot(dir + L"\\launcher_" + m.name + L".png", [] {
@@ -742,6 +1051,8 @@ static void shots(const std::wstring& dir) {
             draw();
         }, 4);
     }
+    g_settings.scale = scale;
+    g_settings.display = display;
 }
 
 // ---------------------------------------------------------------- window
@@ -807,14 +1118,17 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_TIMER:
-        if (w == 1) { check_pads(); check_saves(); }
+        if (w == 1) { check_pads(); check_saves(); cleanup_tick(); }
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_ACTIVATE:
         if (LOWORD(w) != WA_INACTIVE) { check_disc(); InvalidateRect(h, nullptr, FALSE); }
         break;
     case WM_GAME_EXITED: game_exited((DWORD)w); return 0;
+    case WM_UPDATE_CHECKED: update_checked((int)w); return 0;
+    case WM_UPDATE_INSTALLED: update_installed(w != 0); return 0;
     case WM_CLOSE:
+        if (s_update == UPD_INSTALLING && s_progress.phase == UPH_REPLACE) return 0; // a second: files are being swapped
         DestroyWindow(h);
         return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -827,7 +1141,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const wchar_t* shot_dir = _wgetenv(L"TB_LAUNCHER_SHOTS");
     // one launcher at a time: a second start brings the first one forward
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\TeamBuddiesLauncher");
+    // (the updater's test harness runs its own, next to a launcher the player may have open)
+    s_mutex = CreateMutexW(nullptr, TRUE, _wgetenv(L"TB_UPDATE_SERVER") ? L"Local\\TeamBuddiesLauncherTest" : L"Local\\TeamBuddiesLauncher");
     if (!shot_dir && GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND other = FindWindowW(kClass, nullptr)) { ShowWindow(other, SW_RESTORE); SetForegroundWindow(other); }
         return 0;
@@ -843,6 +1158,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     s_legacy = cd ? cd : s_dir + L"memcards";
     settings_load(s_ini);
     load_notes();
+    // test harness: pretend to be another version; install what the check finds, then close
+    if (const wchar_t* v = _wgetenv(L"TB_UPDATE_VERSION")) s_version = v;
+    s_update_auto = _wgetenv(L"TB_UPDATE_AUTO") != nullptr;
+    s_show = show;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
@@ -883,7 +1202,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         return 0;
     }
     ShowWindow(s_hwnd, show);
-    SetTimer(s_hwnd, 1, 1500, nullptr); // controllers and memory cards
+    SetTimer(s_hwnd, 1, 1500, nullptr); // controllers and memory cards (and the files an update left)
+    if (wcsstr(GetCommandLineW(), L"--updated")) { // started by the launcher that installed this one
+        update_log(L"started after the update: %s", s_version.c_str());
+        snack(L"Updated to version " + s_version + L".");
+        s_cleanup_tries = 8;
+        cleanup_tick();
+    } else {
+        update_cleanup(s_dir); // what an interrupted install left
+        if (g_settings.check_updates || s_update_auto) check_updates(true);
+    }
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
@@ -891,6 +1219,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     }
     ui::shutdown();
     SDL_Quit();
-    if (mutex) CloseHandle(mutex);
+    if (s_mutex) CloseHandle(s_mutex);
     return 0;
 }

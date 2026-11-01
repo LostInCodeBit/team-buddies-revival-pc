@@ -19,7 +19,7 @@ bool plat_key(PlatKey k);             // held right now
 
 // ---------------------------------------------------------------- shared (platform_common.cpp)
 bool hidden_run();                    // TB_HIDDEN: no window, sound or message boxes (test harness)
-void hotkey(int f);                   // F1..F12 pressed (f = 1..12)
+void hotkey(int f, bool shift = false); // F1..F12 pressed (f = 1..12), with Shift held or not
 void poll_input();                    // keyboard, controllers and scripted input -> g_pads, at every pump
 void platform_request_quit();
 bool platform_quit_requested();
@@ -29,7 +29,12 @@ bool shot_due();                      // a screenshot of the frame being present
 void shot_save(const u8* rgba, int w, int h, int pitch); // RGBA rows, to screenshots/ (or TB_SHOT_DIR)
 void picture_size(int ww, int wh, int native_h, double& vw, double& vh); // size inside the window (aspect)
 void update_widescreen_factor(int ww, int wh);
+void update_screen_scale(int ww, int wh);     // resolution_scale = screen: every frame, with the window's size
 void write_png(const std::string& path, const u8* rgba, int w, int h, int pitch);
 extern int g_sync_interval;           // refreshes per present with vsync, chosen by the pacing
 extern int g_sync_interval_max;       // what the swapchain can do (DXGI 4, SDL GPU 1)
 extern long long g_present_wait;      // ticks the last present call took (it waits while the frame before is queued)
+// the FPS counter (fps_counter.cpp, show_fps): the presenters count every frame they show and draw its chip
+struct FpsOverlay { const u32* rgba = nullptr; int x = 0, y = 0, w = 0, h = 0; unsigned version = 0; }; // premultiplied RGBA, 1:1
+void fps_frame_presented();
+const FpsOverlay* fps_overlay(int window_h); // nullptr while the counter is off

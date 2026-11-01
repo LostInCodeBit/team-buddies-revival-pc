@@ -35,6 +35,17 @@ static bool image_active(int img) {
     return true;
 }
 
+std::string rec_loaded_overlays() {
+    std::string s;
+    for (int i = 0; i < g_rec_image_count; i++) {
+        if (!s_img_shared[i] || !image_active(i)) continue;
+        std::string n = g_rec_images[i].name;
+        if (!s.empty()) s += ' ';
+        s += n.substr(0, n.find('.'));
+    }
+    return s;
+}
+
 struct LookupCache { u32 addr; const std::vector<int>* v; };
 static LookupCache s_cache[8192];
 

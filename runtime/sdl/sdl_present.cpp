@@ -20,6 +20,11 @@ static int s_shot_w, s_shot_h;
 static SDL_GPUTexture* s_image;        // CPU-made pictures (software renderer, 24-bit movies)
 static SDL_GPUTransferBuffer* s_image_up;
 static int s_image_w, s_image_h;
+static SDL_GPUGraphicsPipeline* s_pipe_ov_window, * s_pipe_ov_shot; // the FPS counter's chip (premultiplied alpha)
+static SDL_GPUTexture* s_ov;
+static SDL_GPUTransferBuffer* s_ov_up;
+static int s_ov_w, s_ov_h;
+static unsigned s_ov_version;
 
 SDL_GPUDevice* sdl_gpu() { return s_gpu; }
 
@@ -64,9 +69,15 @@ SDL_GPUShader* sdl_shader(const char* name) {
     return nullptr;
 }
 
-static SDL_GPUGraphicsPipeline* present_pipeline(SDL_GPUShader* vs, SDL_GPUShader* ps, SDL_GPUTextureFormat fmt) {
+static SDL_GPUGraphicsPipeline* present_pipeline(SDL_GPUShader* vs, SDL_GPUShader* ps, SDL_GPUTextureFormat fmt, bool premul = false) {
     SDL_GPUColorTargetDescription ct = {};
     ct.format = fmt;
+    if (premul) {
+        ct.blend_state.enable_blend = true;
+        ct.blend_state.src_color_blendfactor = ct.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+        ct.blend_state.dst_color_blendfactor = ct.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        ct.blend_state.color_blend_op = ct.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+    }
     SDL_GPUGraphicsPipelineCreateInfo pi = {};
     pi.vertex_shader = vs;
     pi.fragment_shader = ps;
@@ -116,19 +127,23 @@ void sdl_present_shutdown() {
     if (s_shot_dl) SDL_ReleaseGPUTransferBuffer(s_gpu, s_shot_dl);
     if (s_image) SDL_ReleaseGPUTexture(s_gpu, s_image);
     if (s_image_up) SDL_ReleaseGPUTransferBuffer(s_gpu, s_image_up);
+    if (s_ov) SDL_ReleaseGPUTexture(s_gpu, s_ov);
+    if (s_ov_up) SDL_ReleaseGPUTransferBuffer(s_gpu, s_ov_up);
     if (s_pipe_window) SDL_ReleaseGPUGraphicsPipeline(s_gpu, s_pipe_window);
     if (s_pipe_shot) SDL_ReleaseGPUGraphicsPipeline(s_gpu, s_pipe_shot);
+    if (s_pipe_ov_window) SDL_ReleaseGPUGraphicsPipeline(s_gpu, s_pipe_ov_window);
+    if (s_pipe_ov_shot) SDL_ReleaseGPUGraphicsPipeline(s_gpu, s_pipe_ov_shot);
     if (s_point) SDL_ReleaseGPUSampler(s_gpu, s_point);
     if (s_linear) SDL_ReleaseGPUSampler(s_gpu, s_linear);
     if (s_claimed) SDL_ReleaseWindowFromGPUDevice(s_gpu, sdl_window());
     SDL_DestroyGPUDevice(s_gpu);
     s_gpu = nullptr;
     s_claimed = false;
-    s_shot = s_image = nullptr;
-    s_shot_dl = s_image_up = nullptr;
-    s_pipe_window = s_pipe_shot = nullptr;
+    s_shot = s_image = s_ov = nullptr;
+    s_shot_dl = s_image_up = s_ov_up = nullptr;
+    s_pipe_window = s_pipe_shot = s_pipe_ov_window = s_pipe_ov_shot = nullptr;
     s_point = s_linear = nullptr;
-    s_shot_w = s_shot_h = s_image_w = s_image_h = 0;
+    s_shot_w = s_shot_h = s_image_w = s_image_h = s_ov_w = s_ov_h = 0;
     s_vsync = -1;
 }
 
@@ -153,12 +168,18 @@ void sdl_present_init() {
     }
     SDL_GPUShader* vs = sdl_shader("vs_present");
     SDL_GPUShader* ps = sdl_shader("ps_present");
+    SDL_GPUShader* po = sdl_shader("ps_overlay");
     if (vs && ps) {
         if (s_claimed) s_pipe_window = present_pipeline(vs, ps, SDL_GetGPUSwapchainTextureFormat(s_gpu, w));
         s_pipe_shot = present_pipeline(vs, ps, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM);
     }
+    if (vs && po) { // without them the game runs on, only the FPS counter is missing
+        if (s_claimed) s_pipe_ov_window = present_pipeline(vs, po, SDL_GetGPUSwapchainTextureFormat(s_gpu, w), true);
+        s_pipe_ov_shot = present_pipeline(vs, po, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, true);
+    }
     if (vs) SDL_ReleaseGPUShader(s_gpu, vs);
     if (ps) SDL_ReleaseGPUShader(s_gpu, ps);
+    if (po) SDL_ReleaseGPUShader(s_gpu, po);
     s_point = make_sampler(SDL_GPU_FILTER_NEAREST);
     s_linear = make_sampler(SDL_GPU_FILTER_LINEAR);
     if (!s_pipe_shot || (s_claimed && !s_pipe_window) || !s_point || !s_linear) {
@@ -196,8 +217,62 @@ static bool shot_target(int w, int h) {
     return false;
 }
 
+// the FPS counter's chip into s_ov (copied when it changed); false if there is nothing to draw
+static bool overlay_upload(SDL_GPUCommandBuffer* cmd, const FpsOverlay* o) {
+    if (!o || !s_pipe_ov_shot) return false;
+    if (!s_ov || s_ov_w != o->w || s_ov_h != o->h) {
+        if (s_ov) SDL_ReleaseGPUTexture(s_gpu, s_ov);
+        if (s_ov_up) SDL_ReleaseGPUTransferBuffer(s_gpu, s_ov_up);
+        SDL_GPUTextureCreateInfo ti = {};
+        ti.type = SDL_GPU_TEXTURETYPE_2D;
+        ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ti.width = (Uint32)o->w;
+        ti.height = (Uint32)o->h;
+        ti.layer_count_or_depth = 1;
+        ti.num_levels = 1;
+        s_ov = SDL_CreateGPUTexture(s_gpu, &ti);
+        SDL_GPUTransferBufferCreateInfo bi = {};
+        bi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        bi.size = (Uint32)o->w * (Uint32)o->h * 4;
+        s_ov_up = SDL_CreateGPUTransferBuffer(s_gpu, &bi);
+        s_ov_w = o->w;
+        s_ov_h = o->h;
+        s_ov_version = o->version - 1; // copy it below
+        if (!s_ov || !s_ov_up) {
+            log_once("gpu fps", "gpu: no FPS counter texture (%s)\n", SDL_GetError());
+            if (s_ov) SDL_ReleaseGPUTexture(s_gpu, s_ov);
+            if (s_ov_up) SDL_ReleaseGPUTransferBuffer(s_gpu, s_ov_up);
+            s_ov = nullptr;
+            s_ov_up = nullptr;
+            s_ov_w = s_ov_h = 0;
+            return false;
+        }
+    }
+    if (s_ov_version == o->version) return true;
+    u8* p = (u8*)SDL_MapGPUTransferBuffer(s_gpu, s_ov_up, true);
+    if (!p) return false;
+    memcpy(p, o->rgba, (size_t)o->w * o->h * 4);
+    SDL_UnmapGPUTransferBuffer(s_gpu, s_ov_up);
+    SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo src = {};
+    src.transfer_buffer = s_ov_up;
+    src.pixels_per_row = (Uint32)o->w;
+    src.rows_per_layer = (Uint32)o->h;
+    SDL_GPUTextureRegion dst = {};
+    dst.texture = s_ov;
+    dst.w = (Uint32)o->w;
+    dst.h = (Uint32)o->h;
+    dst.d = 1;
+    SDL_UploadToGPUTexture(cp, &src, &dst, true);
+    SDL_EndGPUCopyPass(cp);
+    s_ov_version = o->version;
+    return true;
+}
+
 static void draw(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* target, int tw, int th, SDL_GPUGraphicsPipeline* pipe,
-                 SDL_GPUTexture* tex, float u0, float v0, float u1, float v1, int native_h, bool enabled) {
+                 SDL_GPUTexture* tex, float u0, float v0, float u1, float v1, int native_h, bool enabled,
+                 SDL_GPUGraphicsPipeline* ov_pipe, const FpsOverlay* ov) {
     SDL_GPUColorTargetInfo ct = {};
     ct.texture = target;
     ct.clear_color = {0, 0, 0, 1};
@@ -217,6 +292,16 @@ static void draw(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* target, int tw, int 
         SDL_BindGPUFragmentSamplers(rp, 0, &b, 1);
         SDL_DrawGPUPrimitives(rp, 4, 1, 0, 0);
     }
+    if (ov && ov_pipe) {
+        SDL_GPUViewport vp = {(float)ov->x, (float)ov->y, (float)ov->w, (float)ov->h, 0, 1};
+        SDL_SetGPUViewport(rp, &vp);
+        SDL_BindGPUGraphicsPipeline(rp, ov_pipe);
+        const float rect[4] = {0, 0, 1, 1};
+        SDL_PushGPUVertexUniformData(cmd, 0, rect, sizeof rect);
+        SDL_GPUTextureSamplerBinding b = {s_ov, s_point};
+        SDL_BindGPUFragmentSamplers(rp, 0, &b, 1);
+        SDL_DrawGPUPrimitives(rp, 4, 1, 0, 0);
+    }
     SDL_EndGPURenderPass(rp);
 }
 
@@ -227,12 +312,15 @@ bool sdl_show(SDL_GPUTexture* tex, int tex_w, int tex_h, float u0, float v0, flo
     g_present_wait = 0;
     if (ww <= 0 || wh <= 0) { sdl_submit(false); return false; } // minimized: nothing to draw
     update_widescreen_factor(ww, wh);
+    update_screen_scale(ww, wh);
     apply_present_mode();
     if (tex_w <= 0 || tex_h <= 0) tex = nullptr;
     SDL_GPUCommandBuffer* cmd = sdl_cmd();
+    const FpsOverlay* ov = fps_overlay(wh);
+    if (!overlay_upload(cmd, ov)) ov = nullptr;
     const bool shot = shot_due() && shot_target(ww, wh);
     if (shot) {
-        draw(cmd, s_shot, ww, wh, s_pipe_shot, tex, u0, v0, u1, v1, native_h, enabled);
+        draw(cmd, s_shot, ww, wh, s_pipe_shot, tex, u0, v0, u1, v1, native_h, enabled, s_pipe_ov_shot, ov);
         SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
         SDL_GPUTextureRegion src = {};
         src.texture = s_shot;
@@ -256,11 +344,12 @@ bool sdl_show(SDL_GPUTexture* tex, int tex_w, int tex_h, float u0, float v0, flo
             log_once("gpu acquire", "gpu: no swapchain texture (%s)\n", SDL_GetError());
         g_present_wait = plat_ticks() - t0;
         if (swap) {
-            draw(cmd, swap, (int)sw, (int)sh, s_pipe_window, tex, u0, v0, u1, v1, native_h, enabled);
+            draw(cmd, swap, (int)sw, (int)sh, s_pipe_window, tex, u0, v0, u1, v1, native_h, enabled, s_pipe_ov_window, ov);
             shown = true;
         }
     }
     sdl_submit(shot);
+    if (shown) fps_frame_presented();
     if (shot) {
         if (const u8* p = (const u8*)SDL_MapGPUTransferBuffer(s_gpu, s_shot_dl, false)) {
             shot_save(p, ww, wh, ww * 4);

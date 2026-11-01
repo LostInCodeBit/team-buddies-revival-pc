@@ -1,6 +1,7 @@
 # package_release.ps1 - the portable release zip for GitHub. It copies an explicit list of files (the three
 # binaries from build\, the docs and the licences), so settings, logs, saves, debug files and anything from the
-# disc never end up in it, and writes SHA256SUMS.txt next to it.
+# disc never end up in it, and writes SHA256SUMS.txt next to it, signed for the launcher's updater
+# (SHA256SUMS.txt.sig, tools/sign_release.ps1; the key comes from tools/release_key.ps1).
 # Usage: tools\package_release.ps1 -Version 0.2.0 -SourceUrl https://github.com/<owner>/<repo>
 param(
     [Parameter(Mandatory)] [ValidatePattern('^\d+\.\d+\.\d+([-+][0-9A-Za-z.]+)?$')] [string]$Version,
@@ -68,3 +69,10 @@ $lines += "$hash  $name.zip"
 Move-Item "$sums.tmp" $sums -Force
 "{0}  {1:N1} MB" -f $zip, ((Get-Item $zip).Length / 1MB)
 "$sums  $hash"
+
+# the launcher installs a release only when SHA256SUMS.txt is signed with the release key (tools/release_key.ps1)
+try { & (Join-Path $PSScriptRoot "sign_release.ps1") -Dist $dist }
+catch {
+    Remove-Item (Join-Path $dist "SHA256SUMS.txt.sig") -ErrorAction SilentlyContinue # never a stale signature
+    Write-Warning "SHA256SUMS.txt is not signed ($($_.Exception.Message)): launchers will not install this release by themselves"
+}

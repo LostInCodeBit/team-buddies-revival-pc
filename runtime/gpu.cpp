@@ -369,7 +369,10 @@ void gpu_gp1(u32 v) {
     case 0x05: {
         u32 ox = s_disp_x, oy = s_disp_y;
         s_disp_x = v & 0x3FE; s_disp_y = (v >> 10) & 0x1FF;
-        if (s_disp_x != ox || s_disp_y != oy) interp_flip(gpu_display()); // a finished frame is shown
+        if (s_disp_x != ox || s_disp_y != oy) { // a finished frame is shown
+            interp_flip(gpu_display());
+            fps_game_frame();
+        }
         if (gpu_tracing()) {
             plog("  display %d,%d\n", s_disp_x, s_disp_y);
             static int stacks = 0; // the first few flips: who presents (finds the game's main loop)

@@ -34,3 +34,5 @@ float4 ps_main(VO i) : SV_Target {
             acc += tex.SampleLevel(smp, i.uv + (float2(x, y) + 0.5 - n * 0.5) * fp / n / size, 0).rgb; // no gradients in a loop
     return float4(acc / (n.x * n.y), 1);
 }
+// the FPS counter's chip, drawn 1:1 over the picture (premultiplied alpha)
+float4 ps_overlay(VO i) : SV_Target { return tex.SampleLevel(smp, i.uv, 0); }

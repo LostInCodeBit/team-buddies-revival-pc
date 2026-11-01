@@ -37,6 +37,7 @@ struct Popup {
     Rc anchor;
     std::vector<std::wstring> items;
     int selected = -1;
+    float scroll = -1;              // list offset when it is taller than the window (-1: place the choice in view)
     int result_id = 0, result = -1; // choice made, delivered to dropdown(id) on the next frame
 } static s_pop;
 
@@ -341,6 +342,7 @@ static bool button(int id, Rc r, const std::wstring& label, wchar_t glyph, bool 
 
 bool button_filled(int id, Rc r, const std::wstring& l, wchar_t g, bool e) { return button(id, r, l, g, e, col::primary, col::on_primary, 0); }
 bool button_tonal(int id, Rc r, const std::wstring& l, wchar_t g, bool e) { return button(id, r, l, g, e, col::secondary_container, col::on_secondary_container, 0); }
+bool button_tertiary(int id, Rc r, const std::wstring& l, wchar_t g, bool e) { return button(id, r, l, g, e, col::tertiary, col::on_tertiary, 0); }
 bool button_outlined(int id, Rc r, const std::wstring& l, wchar_t g, bool e) { return button(id, r, l, g, e, 0, col::primary, col::outline); }
 bool button_text(int id, Rc r, const std::wstring& l, wchar_t g, bool e) { return button(id, r, l, g, e, 0, col::primary, 0); }
 
@@ -439,6 +441,7 @@ bool dropdown(int id, Rc r, const std::vector<std::wstring>& items, int& v, bool
         s_pop.anchor = r;
         s_pop.items = items;
         s_pop.selected = v;
+        s_pop.scroll = -1;
         request_frame();
     }
     return changed;
@@ -450,10 +453,13 @@ void popups() {
     const float ih = 40;
     float mw = s_pop.anchor.w;
     for (auto& s : s_pop.items) mw = std::max(mw, text_width(s, F_BODY) + 64);
-    float mh = ih * s_pop.items.size() + 16;
+    // a list taller than the window scrolls (wheel), opened with the current choice in view
+    const float full = ih * s_pop.items.size() + 16, mh = std::min(full, H - 16), maxs = full - mh;
     Rc m = {s_pop.anchor.r() - mw, s_pop.anchor.b() + 4, mw, mh};
     if (m.b() > H - 8) m.y = s_pop.anchor.y - 4 - mh; // no room below: open upwards
     m.y = std::max(8.0f, m.y);
+    if (s_pop.scroll < 0) s_pop.scroll = std::clamp(8 + ih * s_pop.selected + ih / 2 - mh / 2, 0.0f, maxs);
+    if (maxs > 0 && m.in(in.mx, in.my)) s_pop.scroll = std::clamp(s_pop.scroll - in.wheel * ih * 2, 0.0f, maxs);
     if (!s_anim.count(0x7FFF0000 + s_pop.id)) s_anim[0x7FFF0000 + s_pop.id] = 0.0f;
     float k = anim(0x7FFF0000 + s_pop.id, 1.0f, 24); // grows in from the field
     // shadow (elevation 2), then the container
@@ -463,13 +469,15 @@ void popups() {
     fill(grow, col::surface_container, 12);
     push_clip(grow);
     for (int i = 0; i < (int)s_pop.items.size(); i++) {
-        Rc it = {m.x, m.y + 8 + ih * i, m.w, ih};
+        Rc it = {m.x, m.y + 8 + ih * i - s_pop.scroll, m.w, ih};
+        if (it.b() <= m.y || it.y >= m.b()) continue;
         bool sel = i == s_pop.selected;
         if (sel) fill(it, col::alpha(col::secondary_container, 1.0f), 0);
         state_layer(it, 0x7FFE0000 + i, col::on_surface, 0);
         if (sel) icon(ic::check, {it.x + 12, it.y, 20, ih}, col::on_secondary_container);
         text(s_pop.items[i], {it.x + 44, it.y, it.w - 56, ih}, F_BODY, sel ? col::on_secondary_container : col::on_surface);
-        if (clicked(0x7FFE0000 + i, it)) {
+        const float hy = std::max(it.y, m.y);
+        if (clicked(0x7FFE0000 + i, {it.x, hy, it.w, std::min(it.b(), m.b()) - hy})) { // only its visible part
             s_pop.result_id = s_pop.id;
             s_pop.result = i;
             s_pop.open = false;
@@ -477,6 +485,10 @@ void popups() {
         }
     }
     pop_clip();
+    if (maxs > 0) { // scroll position
+        float th = std::max(32.0f, mh * mh / full), ty = m.y + (mh - th) * (s_pop.scroll / maxs);
+        fill({m.r() - 6, ty + 4, 4, th - 8}, col::alpha(col::on_surface_variant, 0.38f), 2);
+    }
     s_pop.drawing = false;
     // a press outside the menu closes it without reaching what is underneath
     if (s_pop.open && in.pressed && !m.in(in.mx, in.my)) { s_pop.open = false; s_anim.erase(0x7FFF0000 + s_pop.id); request_frame(); }

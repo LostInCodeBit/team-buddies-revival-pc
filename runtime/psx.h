@@ -73,6 +73,7 @@ void timers_hblank_reset();
 void cpu_init();
 void cpu_run(u32 pc);
 RecFn rec_lookup(u32 addr);
+std::string rec_loaded_overlays(); // the overlays loaded where they share memory (MNU, ROT, MPLR, GAME), space-separated
 void interp_call(CPU* c, u32 pc);
 extern int g_exception_depth;
 
@@ -106,6 +107,7 @@ struct DisplayInfo {
 DisplayInfo gpu_display();
 extern bool g_gpu_widescreen_hack;
 extern int g_gpu_widescreen_q16;
+int render_scale(); // the hardware renderer's multiple: resolution_scale, or what "screen" picks for the window
 
 // ------------------------------------------------------------------ renderer backend
 struct Vertex {
@@ -231,6 +233,7 @@ void* platform_hwnd();
 void platform_get_window_size(int& w, int& h);
 void platform_toggle_fullscreen();
 void platform_present_image(const u32* rgba, int w, int h, int stride, bool enabled); // a CPU-made picture (software renderer, 24-bit movies)
+void fps_game_frame();                // the game flipped to a new frame (FPS counter)
 extern Renderer* g_renderer;
 extern std::string g_base_dir;
 extern std::string g_ini_path; // teambuddies.ini, or TB_INI (test harness)
@@ -276,6 +279,9 @@ void card_replace(int slot, const u8* data128k);
 // ------------------------------------------------------------------ online play (netplay.cpp)
 bool netplay_start(int argc, char** argv, const std::vector<u8>& exe); // false = cancelled, quit
 bool netplay_active();
+// Discord Rich Presence (discord.cpp)
+void discord_start();     // once, after the settings are read
+void discord_tick();      // every vblank, on the game thread
 void netplay_sync();      // at every frame boundary, after local input was read into g_pads[0]
 void netplay_shutdown();  // tell the peer, restore local settings
 int netplay_local_slot(); // player index of this machine (0 when offline)

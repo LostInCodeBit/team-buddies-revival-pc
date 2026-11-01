@@ -89,7 +89,7 @@ struct HwRenderer : Renderer {
     virtual void show_vram(const DisplayInfo& d) = 0;      // present() of a 15-bit display
 
     // the resolution or the sample count changed since the targets were made
-    bool targets_stale() const { return S != g_settings.scale || want_ms != aa_samples(g_settings.anti_aliasing); }
+    bool targets_stale() const { return S != render_scale() || want_ms != aa_samples(g_settings.anti_aliasing); }
 
     DrawCB make_cb(int pass, float factor, const float* rect = nullptr, const float* fillc = nullptr) const {
         DrawCB c = {};
@@ -371,7 +371,7 @@ struct HwRenderer : Renderer {
     void rescale() {
         flush();
         download(0, 0, 1024, 512);
-        create_targets(g_settings.scale, aa_samples(g_settings.anti_aliasing));
+        create_targets(render_scale(), aa_samples(g_settings.anti_aliasing));
         memset(dirty, 0, sizeof dirty);
         any_dirty = false;
         upload_rect(0, 0, 1024, 512);

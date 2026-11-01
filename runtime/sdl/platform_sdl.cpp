@@ -55,8 +55,21 @@ static int s_full_mode = DISPLAY_BORDERLESS; // what F11 switches to: borderless
 static void set_fullscreen(bool on) {
     if (!s_window || on == s_fullscreen) return;
     s_fullscreen = on;
-    // exclusive: the desktop's own mode set explicitly; borderless: no mode (Wayland only has that one)
-    const SDL_DisplayMode* m = on && s_full_mode == DISPLAY_FULLSCREEN ? SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(s_window)) : nullptr;
+    // exclusive: fullscreen_resolution (at the desktop's refresh rate or the closest) or the desktop's own mode,
+    // set explicitly; borderless: no mode (Wayland only has that one)
+    const SDL_DisplayMode* m = nullptr;
+    SDL_DisplayMode chosen;
+    if (on && s_full_mode == DISPLAY_FULLSCREEN) {
+        const SDL_DisplayID d = SDL_GetDisplayForWindow(s_window);
+        m = SDL_GetDesktopDisplayMode(d);
+        const int w = g_settings.fullscreen_w, h = g_settings.fullscreen_h;
+        if (w > 0 && h > 0) {
+            if (SDL_GetClosestFullscreenDisplayMode(d, w, h, m ? m->refresh_rate : 0.0f, false, &chosen) && chosen.w == w && chosen.h == h) {
+                m = &chosen;
+                plog("display: fullscreen %dx%d at %.2f Hz\n", w, h, chosen.refresh_rate);
+            } else plog("display: the monitor has no %dx%d mode, fullscreen keeps the desktop's\n", w, h);
+        }
+    }
     SDL_SetWindowFullscreenMode(s_window, m);
     SDL_SetWindowFullscreen(s_window, on);
 }
@@ -98,7 +111,7 @@ static void handle_event(const SDL_Event& e) {
     case SDL_EVENT_KEY_DOWN:
         if (e.key.repeat) break;
         if (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)) { platform_toggle_fullscreen(); break; }
-        if (e.key.key >= SDLK_F1 && e.key.key <= SDLK_F12) hotkey((int)(e.key.key - SDLK_F1) + 1);
+        if (e.key.key >= SDLK_F1 && e.key.key <= SDLK_F12) hotkey((int)(e.key.key - SDLK_F1) + 1, (e.key.mod & SDL_KMOD_SHIFT) != 0);
         break;
     default: gamepad_event(e); break;
     }

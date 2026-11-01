@@ -26,11 +26,13 @@ The launcher's Settings page (Windows) writes these; the file can also be edited
 | Key | Values |
 |---|---|
 | `renderer` | `hardware` (upscaled: Direct3D 11 on Windows, Vulkan on Linux) or `software` (original 1x) |
-| `resolution_scale` | 1–8 (internal resolution multiplier; above the window's size it is averaged down, like supersampling) |
+| `resolution_scale` | 1–8 (internal resolution multiplier; above the window's size it is averaged down, like supersampling), or `screen`: the smallest that fills the picture on your screen (in a window, the window's, as it resizes) |
 | `anti_aliasing` | `off`, `fxaa`, `msaa2x`/`4x`/`8x` (polygon edges), `ssaa2x`/`4x`/`8x` (edges and textures) (hardware renderer, F1) |
 | `display` | `window`, `borderless`, `fullscreen` (exclusive) |
 | `window_width`, `window_height` | window size for `display = window` |
+| `fullscreen_resolution` | `desktop` or `WIDTHxHEIGHT` (e.g. `1920x1080`): the screen's mode for `display = fullscreen`, at the desktop's refresh rate when the monitor has it at that size; a size the monitor lacks keeps the desktop's |
 | `vsync` | `true` / `false` |
+| `show_fps` | `true` / `false`: an FPS counter in the top-left corner (Shift+F10): FPS = frames shown per second (in-between frames included), GAME = the game's own new frames per second (30 in battle, 60 in menus, lower when it slows down) |
 | `frame_rate` | `original` (gameplay runs at 30), a rate such as `60`, `120`, `144`, `240` (up to 500), or `monitor` (its refresh rate): in-between frames are drawn, the game keeps its speed; with `vsync` at most the monitor's rate (hardware renderer, F10) |
 | `aspect` | `4:3`, `16:9`, `wide` (the window's shape), `stretch`, `pixels` (whole-number scaling) |
 | `widescreen_hack` | widens the 3D view (to 16:9, or to the window's shape with `aspect = wide`) |
@@ -40,9 +42,11 @@ The launcher's Settings page (Windows) writes these; the file can also be edited
 | `smooth_output` | bilinear filtering of the final image |
 | `cpu_cycles_per_instruction` | 2.0 = original speed, lower = faster CPU (less slowdown) |
 | `multitap` | emulate a multitap on port 1 (4 players) |
-| `volume` | 0–100 |
+| `volume` | 0–200 (percent): 100 is the original loudness; above it is louder, with the loudest peaks rounded off instead of crackling |
 | `vibration` | controller rumble |
 | `skip_intro` | tap Start through the logos, intro movies and title at boot |
+| `check_updates` | `true` / `false`: the Windows launcher asks GitHub for a newer release when it opens; "Update now" installs a signed one and keeps settings and saves |
+| `discord_presence` | `true` / `false`: Discord shows that you're playing and where (menus, story map, battle, a movie); needs the Discord app running on the same PC |
 | `button_icons` | `auto` (prompts follow the device used last), `playstation`, `xbox`, `keyboard` |
 | `online_address`, `online_port` | last host joined and UDP port (F9 dialog) |
 | `log_level` | 0 = errors only, 1 = warnings (default), 2 = live status log + console window |
@@ -55,8 +59,8 @@ hot-pluggable) are players 1–4; the first shares player 1 with the keyboard. B
 between PlayStation, Xbox and keyboard glyphs to match the device you last used.
 
 Hotkeys: F1 anti-aliasing, F2/F3 internal resolution, F4 widescreen hack, F5 smooth output, F6 aspect ratio,
-F7 texture filtering, F8 true color, F9 online play, F10 frame rate (original / the configured rate), F11 or
-Alt+Enter fullscreen, F12 screenshot (`screenshots\`), hold Tab to fast-forward.
+F7 texture filtering, F8 true color, F9 online play, F10 frame rate (original / the configured rate),
+Shift+F10 FPS counter, F11 or Alt+Enter fullscreen, F12 screenshot (`screenshots\`), hold Tab to fast-forward.
 
 ## Online play (2 players, work in progress)
 

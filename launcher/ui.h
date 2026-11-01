@@ -38,7 +38,7 @@ enum Align { A_LEFT, A_CENTER, A_RIGHT };
 namespace ic {
 const wchar_t play = 0xE768, settings = 0xE713, notes = 0xE8A5, disc = 0xE958, game = 0xE7FC, save = 0xE74E;
 const wchar_t chevron = 0xE70D, check = 0xE73E, minimize = 0xE921, close = 0xE8BB, reset = 0xE72C, folder = 0xE8B7;
-const wchar_t warning = 0xE7BA, keyboard = 0xE765, info = 0xE946;
+const wchar_t warning = 0xE7BA, keyboard = 0xE765, info = 0xE946, download = 0xE896, sync = 0xE895;
 } // namespace ic
 
 namespace ui {
@@ -83,6 +83,7 @@ void state_layer(Rc r, int id, u32 on_color, float radius); // M3 hover/press ov
 // widgets
 bool button_filled(int id, Rc r, const std::wstring& label, wchar_t glyph = 0, bool enabled = true);
 bool button_tonal(int id, Rc r, const std::wstring& label, wchar_t glyph = 0, bool enabled = true);
+bool button_tertiary(int id, Rc r, const std::wstring& label, wchar_t glyph = 0, bool enabled = true); // filled, on a tertiary container
 bool button_outlined(int id, Rc r, const std::wstring& label, wchar_t glyph = 0, bool enabled = true);
 bool button_text(int id, Rc r, const std::wstring& label, wchar_t glyph = 0, bool enabled = true);
 bool icon_button(int id, Rc r, wchar_t glyph, u32 hover_bg = 0);

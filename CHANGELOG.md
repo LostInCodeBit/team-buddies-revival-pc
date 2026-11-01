@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- FPS counter: press Shift+F10 in game (or turn it on in the launcher under Settings > Display) to see your
+  frame rate in the top-left corner.
+- The Windows launcher now updates itself. When a new version is out, click "Update now" and it downloads and
+  installs it for you; your settings and saves stay as they are. You can turn the check off in Settings > Game.
+- Pick your screen resolution for Fullscreen in the launcher (Settings > Display).
+- Resolution can now match your screen: pick the first choice under Settings > Graphics > Resolution and the
+  game draws the picture just sharp enough to fill your screen (or your window, even when you resize it).
+- Volume now goes up to 200% for when the game is too quiet.
+- Discord status: your Discord profile shows you're playing Team Buddies and whether you're in the menus or in
+  a battle. You can turn it off in Settings > Game.
+
+### Fixed
+- The buddies' feet no longer flicker or break apart while walking at higher frame rates.
+- The launcher's Wide and Stretch buttons (Settings > Display > Aspect) were mixed up; each now picks what it says.
+
 ## 0.2.0 - 2026-10-31
 
 The Linux version is new and **experimental**: it has been tested under WSL (Mesa's llvmpipe) and, as the

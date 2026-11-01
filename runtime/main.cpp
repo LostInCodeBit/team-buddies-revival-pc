@@ -145,6 +145,7 @@ int main(int argc, char** argv) {
     g_renderer = renderer_create_hardware(gpu_vram());
     if (!g_renderer) g_renderer = renderer_create_software(gpu_vram());
     if (!netplay_start(argc, argv, exe)) { platform_shutdown(); return 0; } // --host / --join
+    discord_start();
 
     bios_boot(exe);
     sched_start();
