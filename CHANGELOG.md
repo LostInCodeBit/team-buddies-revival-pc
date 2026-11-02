@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-02
+
+From this version on, the Windows launcher updates itself. Coming from 0.1.0 or 0.2.0, unzip this one over
+your old folder once; your settings and saves stay.
 
 ### Added
 - FPS counter: press Shift+F10 in game (or turn it on in the launcher under Settings > Display) to see your
